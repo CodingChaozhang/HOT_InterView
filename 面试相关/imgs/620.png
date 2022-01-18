@@ -1,0 +1,2726 @@
+# 【面试篇】HashMap1.7和HashMap1.8的详细区别对比
+
+| 不同之处                 | JDK1.7                                                       | JDK1.8                                                       |
+| ------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| 存储结构                 | **数组+链表**                                                | **数组+链表+红黑树**                                         |
+| 初始化方式               | 单独函数：`inflateTable()`                                   | 直接集成到了`resize()`中                                     |
+| hash值计算               | 扰动处理=**4次位运算+5次异或运算**                           | 扰动处理=**1次位运算+1次异或运算**                           |
+| 存放数据的规则           | **无冲突时，存放数组；冲突时，存放链表**                     | **无冲突时，存放数组**；**冲突&链表长度<8: 存放链表**；**冲突&链表长度>8且数组长度>64转换为红黑树JDK1.7** |
+| 插入数据方式             | **头插法**                                                   | **尾插法**                                                   |
+| 扩容后存储位置的计算方式 | **按之前索引的计算方式：hashcode->>扰动函数->>(h&length-1)** | **按照扩容后的规律计算(即扩容后的位置=原位置 or 原位置+旧容量)** |
+
+> 结构上；
+>
+> 初始化->Hash计算->存储方式->链表插入方式->扩容方式
+
+**JDK1.8主要解决了以下问题：**
+
+- resize扩容优化问题
+- 引入了红黑树，避免单条链表过长而影响查询效率
+- 解决了多线程死循环问题，但仍是非线程安全的，多线程时可能会造成**数据丢失**的问题。
+
+## 一、存储结构方面的变化
+
+> 背景：HashMap通过key的hashCode经过扰动函数处理过后得到hash值，然后通过`(n-1)&hash`判断当前元素存放的位置，如果当前位置存在元素的话，就判断该元素与要存入的元素的hash值以及key是否相同，如果相同的话，直接覆盖，不相同就通过拉链法解决冲突(红黑树).
+
+JDK1.7：数组 + 链表
+
+JDK1.8：数组 + 链表 + 红黑树
+
+引入原因：**解决哈希碰撞后，链表过长从而导致索引效率变化的问题**
+
+![image-20201210123554255](./imgs_vector/03_03/1.png)
+
+### 题目一、为什么选择6和8？
+
+**红黑树的节点占用空间是普通链表节点的2倍**，而且**碰撞节点的分布频率满足泊松分布，链表长度达到8个元素的概率为0.00000006，几乎是不可能事件。**
+
+**中间有差值可以防止链表和红黑树之间的频繁转换。**
+
+假如：如果设计成链表个数超过8就链表转换为红黑树，链表个数小于8就红黑树结构转换成链表，链表个数在8左右徘徊，就会频繁进行链表转红黑树，红黑树转链表的操作。
+
+### 题目二、为什么红黑树转换时还要求数组大小大于64？
+
+这里不仅仅判断链表个数大于等于 8，还判断了数组大小，数组容量小于 64 没有立即转化的原因，猜测主要是因为**红黑树占用的空间比链表大很多**，转化也比较耗时，所以**数组容量小的情况下冲突严重，我们可以先尝试扩容，看看能否通过扩容来解决冲突的问题**。（结点总数/数组容量=负载因子）
+
+## 二、初始化HashMap对象
+
+```java
+/**
+  * 函数使用原型
+  */
+  Map<String,Integer> map = new HashMap<String,Integer>();
+
+ /**
+   * 源码分析：主要是HashMap的构造函数 = 4个
+   * 仅贴出关于HashMap构造函数的源码
+   */
+
+public class HashMap<K,V>
+    extends AbstractMap<K,V>
+    implements Map<K,V>, Cloneable, Serializable{
+
+    // 省略上节阐述的参数
+    
+  /**
+     * 构造函数1：默认构造函数（无参）
+     * 加载因子 & 容量 = 默认 = 0.75、16
+     */
+    public HashMap() {
+        this.loadFactor = DEFAULT_LOAD_FACTOR;
+    }
+
+    /**
+     * 构造函数2：指定“容量大小”的构造函数
+     * 加载因子 = 默认 = 0.75 、容量 = 指定大小
+     */
+    public HashMap(int initialCapacity) {
+        // 实际上是调用指定“容量大小”和“加载因子”的构造函数
+        // 只是在传入的加载因子参数 = 默认加载因子
+        this(initialCapacity, DEFAULT_LOAD_FACTOR);
+        
+    }
+
+    /**
+     * 构造函数3：指定“容量大小”和“加载因子”的构造函数
+     * 加载因子 & 容量 = 自己指定
+     */
+    public HashMap(int initialCapacity, float loadFactor) {
+
+        // 指定初始容量必须非负，否则报错  
+            if (initialCapacity < 0)  
+           throw new IllegalArgumentException("Illegal initial capacity: " +  
+                                           initialCapacity); 
+
+        // HashMap的最大容量只能是MAXIMUM_CAPACITY，哪怕传入的 > 最大容量
+        if (initialCapacity > MAXIMUM_CAPACITY)
+            initialCapacity = MAXIMUM_CAPACITY;
+
+        // 填充比必须为正  
+        if (loadFactor <= 0 || Float.isNaN(loadFactor))  
+            throw new IllegalArgumentException("Illegal load factor: " +  
+                                           loadFactor);  
+        // 设置 加载因子
+        this.loadFactor = loadFactor;
+
+        // 设置 扩容阈值
+        // 注：此处不是真正的阈值，仅仅只是将传入的容量大小转化为：>传入容量大小的最小的2的幂，该阈值后面会重新计算
+        // 下面会详细讲解 ->> 分析1
+        this.threshold = tableSizeFor(initialCapacity); 
+
+    }
+
+    /**
+     * 构造函数4：包含“子Map”的构造函数
+     * 即 构造出来的HashMap包含传入Map的映射关系
+     * 加载因子 & 容量 = 默认
+     */
+
+    public HashMap(Map<? extends K, ? extends V> m) {
+
+        // 设置容量大小 & 加载因子 = 默认
+        this.loadFactor = DEFAULT_LOAD_FACTOR; 
+
+        // 将传入的子Map中的全部元素逐个添加到HashMap中
+        putMapEntries(m, false); 
+    }
+}
+
+   /**
+     * 分析1：tableSizeFor(initialCapacity)
+     * 作用：将传入的容量大小转化为：>传入容量大小的最小的2的幂
+     * 与JDK 1.7对比：类似于JDK 1.7 中 inflateTable()里的 roundUpToPowerOf2(toSize)
+     */
+    static final int tableSizeFor(int cap) {
+     int n = cap - 1;
+     n |= n >>> 1;
+     n |= n >>> 2;
+     n |= n >>> 4;
+     n |= n >>> 8;
+     n |= n >>> 16;
+     return (n < 0) ? 1 : (n >= MAXIMUM_CAPACITY) ? MAXIMUM_CAPACITY : n + 1;
+}
+```
+
+> 背景：HashMap的对象，包含4个构造函数：
+>
+> - 默认构造函数(无参);
+> - 指定容量大小的构造函数；
+> - 指定容量大小和负载因子的构造函数；
+> - 包含子Map的构造函数
+
+在构造函数中仅用于**初始化容量大小(capacity)**、**负载因子(load factor)**,但未真正初始化哈希表，即初始化存储数组table。真正初始话哈希表(初始化数组table)是在第一次添加键值对的时候，即**第一次调用put方法时，进行初始化。**
+
+JDK1.7：在put方法添加元素时会判断table是否为空，若空，则**调用单独的初始化函数inflateTable()**;
+
+JDK1.8：在put方法添加元素时会判断table是否为空，若空，则**调用resize()扩容函数；**
+
+
+
+> 构建HashMap实例时有两个重要的参数，会影响其性能：**初始大小**和**负载因子**。初始大小用来规定**哈希表数组的长度**，即桶的个数。负载因子用来表示哈希表元素的填满程度，越大则表示允许填满的元素就越多，哈希表的空间利用率就越高，但是冲突的机会也就增加了。反之，越小则冲突的机会就会越少，但是空间很多就浪费了。
+
+### 题目一：为什么负载因子是0.75？
+
+考虑空间和时间的效率。扩容时的临界值由【负载因子】和【当前容器的容量大小】来确定。即**hashMap.size>=Capactity x loadFactory**
+
+> 负载因子选择0.75主要是在提高**空间利用率和减少查询成本**的折中下，节点出现在hash桶中遵循**泊松分布**的情况下，选择0.75。
+>
+> - **负载因子过高，如1，虽然减少了空间的开销，提高了空间的利用率，但是增加了查询的时间成本**；空间效率上去，时间效率下来了。
+> - **负载因子过低，如0.5，虽然可以减少查询的时间成本，但空间利用率很低，提高了rehash操作的次数**。时间效率上去，空间效率下来了。
+>
+> 总的来说，HashMap在负载因子0.75的时候，空间利用率，满足泊松分布，而且避免了相当多的Hash冲突，提升了时间效率。
+
+### 题目二：为什么数组容量必须是2次幂？
+
+桶的索引计算公式为 **i =  hash&（n-1） **。效果等于与 **hash%n** 的计算效果，但是位运算比取余运算要高效的多。
+
+**如果n为2次幂，那么n-1的低位就全是1,哈希值进行与操作时可以保证低位的值不变，从而保证分布均匀，不会受到与运算对数据的变化影响。**
+
+数组取2次幂的时候：
+
+![image-20201210093023536](./imgs_vector/03_03/2.png)
+
+**数组不取2次幂的话，会出现重复的数据，而且数组元素分布不均匀，且数组上的某些位置，永远也用不到。**
+
+![image-20201210093146078](./imgs_vector/03_03/3.png)
+
+> hashCode尽可能的使其分布均匀了，那么hashcode与数组的size-1进行位运算，我们就应该尽量减少位运算对其的影响，采用2^n-1,低位都为1，从而保证结果的均匀。若不取2次幂，那么会出现重复的数据，会使得分布不均匀，导致数组上的某些位置，永远取不到。
+
+
+
+## 三、向HashMap添加数据
+
+### 3.1 判断数组是否为空
+
+- jdk1.7：**若空，则调用单独的初始化函数inflateTable();**
+- jdk1.8：**若空，则调用resize()函数。**
+
+不能空，则计算数据在hashMap的索引位置。
+
+### 3.2 计算数据在hashMap的索引值
+
+计算要添加数据在HashMap中的桶索引值，可分为以下两步：**第一步计算Hash值；第二步计算索引值。**
+
+- **第一步计算Hash值**
+  - **先计算哈希码**
+  - **再进行扰动函数操作**
+- **第二步计算索引值**
+  - **通过hash&(length-1)**（效果等同于hash%length计算，但位运算比取余运算要高效的多）
+
+#### 1.计算哈希码
+
+> 预备知识：计算哈希码 h=key.hashCode(). **根据对象的内存地址，经过特定算法返回一个哈希码。**
+>
+> ##### a.整数
+>
+> - 整数值当做哈希值
+> - 比如10的哈希值就是10
+>
+> ```java
+> public static int hashCode(int value){
+>     return value;
+> }
+> ```
+>
+> ##### b.浮点数
+>
+> - 将存储的二进制格式转为整数值
+>
+> ```java
+> public static int hashCode(float value){
+>     return floatToIntBits(value);
+> }
+> ```
+>
+> ##### c.Long的哈希值
+>
+> ```java
+> public static int hashCode(long value){
+>     return (int)(value^(value>>>32));
+> }
+> ```
+>
+> ##### d.Double的哈希值
+>
+> ```java
+> public static int hashCode(double value){
+>     long bits = doubleToLongBits(value);
+>     return (int)(bits^(bits>>>32));
+> }
+> ```
+>
+> > Long和Double中的>>>和^的作用是？
+> >
+> > - 高32bit和低32位混合计算出32bit的哈希值
+> > - 充分利用所有信息计算出哈希值
+>
+> ##### e.字符串的哈希值
+>
+> ![image-20201209215715140](./imgs_vector/03_03/4.png)
+>
+> > 关于31的探讨？
+> >
+> > 1. 奇质数作为哈希运算中的乘法因子，**得到的哈希值效果比较好（分布均匀）**
+> > 2. JVM对于位运算的优化，31*i可优化为(i<<5)-i ,**最后选择31是因为速度比较快**
+
+
+
+#### 2.扰动函数
+
+JDK1.7: 要进行4次位运算 + 5次异或预算
+
+```java
+// JDK 1.7实现：将 键key 转换成 哈希码（hash值）操作  = 使用hashCode() + 4次位运算 + 5次异或运算（9次扰动）
+      static final int hash(int h) {
+        h ^= k.hashCode(); 
+        h ^= (h >>> 20) ^ (h >>> 12);
+        return h ^ (h >>> 7) ^ (h >>> 4);
+     }
+```
+
+JDK1.8：进行1次位运算+1次异或运算
+
+```java
+      // JDK 1.8实现：将 键key 转换成 哈希码（hash值）操作 = 使用hashCode() + 1次位运算 + 1次异或运算（2次扰动）
+      // 1. 取hashCode值： h = key.hashCode() 
+      // 2. 高位参与低位的运算：h ^ (h >>> 16)  
+      static final int hash(Object key) {
+           int h;
+            return (key == null) ? 0 : (h = key.hashCode()) ^ (h >>> 16);
+            // a. 当key = null时，hash值 = 0，所以HashMap的key 可为null      
+            // 注：对比HashTable，HashTable对key直接hashCode（），若key为null时，会抛出异常，所以HashTable的key不可为null
+            // b. 当key ≠ null时，则通过先计算出 key的 hashCode()（记为h），然后 对哈希码进行 扰动处理： 按位 异或（^） 哈希码自身右移16位后的二进制
+     }
+```
+
+设计原因：
+
+**为了效率考虑，进行了缩减。**
+
+`hash`方法实际是让`key.hashCode()`与`key.hashCode()>>>16`进行异或操作，高16bit补0，一个数和0异或不变，所以 hash 函数大概的作用就是：**高16bit不变，低16bit和高16bit做了一个异或，目的是减少碰撞，使其分布均匀**。按照函数注释，因为bucket数组大小是2的幂，计算下标`index = (table.length - 1) & hash`，如果不做 hash 处理，相当于散列生效的只有几个低 bit 位，为了减少散列的碰撞，设计者综合考虑了速度、作用、质量之后，使用高16bit和低16bit异或来简单处理减少碰撞，而且JDK8中用了复杂度 O（logn）的树结构来提升碰撞下的性能。
+
+
+
+#### 题目一、为什么不直接采用hashCode()处理的哈希码作为hashMap的下标位置？
+
+**计算出来的哈希码可能并不在数组大小范围内，从而导致无法匹配位置的情况**。解决方法:哈希码 & (数组长度-1)。
+
+哈希码是32位的，其取值范围为-(2^31) ~ 2^31-1之间。
+
+而哈希表的容量范围最大值为2^30.
+
+#### 题目二、为什么要对哈希码进行二次处理，扰动计算？
+
+**为了进一步提高哈希低位的随机性，使得分布更均匀**，从而**提高对应数组存储下标位置的随机性和均匀性**，从而**减少hash冲突。**
+
+### 3.3 数据具体在哈希表的存放
+
+![image-202012092157151420](./imgs_vector/03_03/5.png)
+
+**JDK1.7 存放数据只需判断数组和链表**
+
+**JDK1.8 存放数据需多次判断：数组、链表和红黑树**
+
+原因：提高查找效率；
+
+
+
+**JDK1.7在插入数据方式时用的头插法（将原位置的数据后移1位，然后再插入数据到该位置）**
+
+**JDK1.8在插入数据方式时用的尾插法（直接插入到链表尾部/红黑树）**
+
+原因：在多线程并发情况下，**头插法会出现链表成环**的问题。（当然在多线程情况下，HashMap本就是线程非安全的。）
+
+
+
+`HashMap`的线程不安全主要体现在以下两个方面：
+
+- 在JDK1.7下，当**并发执行扩容操作时环形链**和**数据丢失**的情况；
+- 在JDK1.8下，当**并发执行put操作时会发生数据覆盖**等情况。
+
+
+
+### 3.4 HashMap的扩容机制resize()
+
+resize()函数的使用有2种情况：
+
+- 初始化哈希表；
+- 当前数组容量过小，需扩容； （**扩容的容量大小会变成原来的2倍，用位运算来加快计算的运行效率**）。
+
+```java
+/**
+     * 分析4：resize（）
+     * 该函数有2种使用情况：1.初始化哈希表 2.当前数组容量过小，需扩容
+     */
+   final Node<K,V>[] resize() {
+    Node<K,V>[] oldTab = table; // 扩容前的数组（当前数组）
+    int oldCap = (oldTab == null) ? 0 : oldTab.length; // 扩容前的数组的容量 = 长度
+    int oldThr = threshold;// 扩容前的数组的阈值
+    int newCap, newThr = 0;
+
+    // 针对情况2：若扩容前的数组容量超过最大值，则不再扩充
+    if (oldCap > 0) {
+        if (oldCap >= MAXIMUM_CAPACITY) {
+            threshold = Integer.MAX_VALUE;
+            return oldTab;
+        }
+
+        // 针对情况2：若无超过最大值，就扩充为原来的2倍
+        else if ((newCap = oldCap << 1) < MAXIMUM_CAPACITY &&
+                 oldCap >= DEFAULT_INITIAL_CAPACITY)
+            newThr = oldThr << 1; // 通过右移扩充2倍
+    }
+
+    // 针对情况1：初始化哈希表（采用指定 or 默认值）
+    else if (oldThr > 0) // initial capacity was placed in threshold
+        newCap = oldThr;
+
+    else {               // zero initial threshold signifies using defaults
+        newCap = DEFAULT_INITIAL_CAPACITY;
+        newThr = (int)(DEFAULT_LOAD_FACTOR * DEFAULT_INITIAL_CAPACITY);
+    }
+
+    // 计算新的resize上限
+    if (newThr == 0) {
+        float ft = (float)newCap * loadFactor;
+        newThr = (newCap < MAXIMUM_CAPACITY && ft < (float)MAXIMUM_CAPACITY ?
+                  (int)ft : Integer.MAX_VALUE);
+    }
+
+    threshold = newThr;
+    @SuppressWarnings({"rawtypes","unchecked"})
+        Node<K,V>[] newTab = (Node<K,V>[])new Node[newCap];
+    table = newTab;
+
+    if (oldTab != null) {
+        // 把每个bucket都移动到新的buckets中
+        for (int j = 0; j < oldCap; ++j) {
+            Node<K,V> e;
+            if ((e = oldTab[j]) != null) {
+                oldTab[j] = null;
+
+                if (e.next == null)
+                    newTab[e.hash & (newCap - 1)] = e;
+                else if (e instanceof TreeNode)
+                    ((TreeNode<K,V>)e).split(this, newTab, j, oldCap);
+
+                else { // 链表优化重hash的代码块
+                    Node<K,V> loHead = null, loTail = null;
+                    Node<K,V> hiHead = null, hiTail = null;
+                    Node<K,V> next;
+                    do {
+                        next = e.next;
+                        // 原索引
+                        if ((e.hash & oldCap) == 0) {
+                            if (loTail == null)
+                                loHead = e;
+                            else
+                                loTail.next = e;
+                            loTail = e;
+                        }
+                        // 原索引 + oldCap
+                        else {
+                            if (hiTail == null)
+                                hiHead = e;
+                            else
+                                hiTail.next = e;
+                            hiTail = e;
+                        }
+                    } while ((e = next) != null);
+                    // 原索引放到bucket里
+                    if (loTail != null) {
+                        loTail.next = null;
+                        newTab[j] = loHead;
+                    }
+                    // 原索引+oldCap放到bucket里
+                    if (hiTail != null) {
+                        hiTail.next = null;
+                        newTab[j + oldCap] = hiHead;
+                    }
+                }
+            }
+        }
+    }
+    return newTab;
+}
+```
+
+![image-202012092157151420](./imgs_vector/03_03/6.png)
+
+
+
+JDK1.7：**插入前，判断是否需扩容**
+
+JDK1.8：**插入结束后，判断是否需扩容**
+
+
+
+JDK1.7：扩容后存储位置的计算方式：**全部按照之前的方法进行重新计算索引**
+
+JDK1.8：扩容后存储位置的计算方式：**按照扩容后的规律计算(扩容后的位置=原位置or原位置+旧容量)**
+
+> 扩容后，若hash值新增参与运算的位=0,那么元素在扩容后的位置=原始位置；
+>
+> 扩容后，若hash值新增参与运算的位=1,那么元素在扩容后的位置 =原始位置+扩容后的旧位置；
+
+
+
+### 3.5 从HashMap中获取数据
+
+```java
+/**
+   * 函数原型
+   * 作用：根据键key，向HashMap获取对应的值
+   */ 
+   map.get(key)；
+
+
+ /**
+   * 源码分析
+   */ 
+   public V get(Object key) {
+    Node<K,V> e;
+    // 1. 计算需获取数据的hash值
+    // 2. 通过getNode（）获取所查询的数据 ->>分析1
+    // 3. 获取后，判断数据是否为空
+    return (e = getNode(hash(key), key)) == null ? null : e.value;
+}
+
+/**
+   * 分析1：getNode(hash(key), key))
+   */ 
+final Node<K,V> getNode(int hash, Object key) {
+    Node<K,V>[] tab; Node<K,V> first, e; int n; K k;
+
+    // 1. 计算存放在数组table中的位置
+    if ((tab = table) != null && (n = tab.length) > 0 &&
+        (first = tab[(n - 1) & hash]) != null) {
+
+        // 4. 通过该函数，依次在数组、红黑树、链表中查找（通过equals（）判断）
+        // a. 先在数组中找，若存在，则直接返回
+        if (first.hash == hash && // always check first node
+            ((k = first.key) == key || (key != null && key.equals(k))))
+            return first;
+
+        // b. 若数组中没有，则到红黑树中寻找
+        if ((e = first.next) != null) {
+            // 在树中get
+            if (first instanceof TreeNode)
+                return ((TreeNode<K,V>)first).getTreeNode(hash, key);
+
+            // c. 若红黑树中也没有，则通过遍历，到链表中寻找
+            do {
+                if (e.hash == hash &&
+                    ((k = e.key) == key || (key != null && key.equals(k))))
+                    return e;
+            } while ((e = e.next) != null);
+        }
+    }
+    return null;
+}
+```
+
+![image-202012092157151420](./imgs_vector/03_03/7.png)
+
+## 总结
+
+简单总结一下HashMap是使用了哪些方法来有效解决了哈希冲突这个问题的。
+
+- 使用**链地址法(使用散列表)来**链接拥有相同hash值的数据；
+- 使用**2次扰动函数(hash函数)来**降低哈希冲突的概率，使得数据分布更平均；
+- 引入红黑树进一步降低遍历的时间复杂度，使得遍历更快。
+
+
+
+
+
+
+
+
+
+                                          
+		return str.matches(reg);
+	}
+	
+	public static void main(String[] args) {
+		System.out.println(arabicNumToChineseNum(39999));
+	}
+}
+```
+
+
+
+### 0.检测循环依赖（类似于课程表）
+
+[['A', 'B'], ['B', 'C'], ['C', 'D'], ['B', 'D']] => false，[['A', 'B'], ['B', 'C'], ['C', 'A']] => true
+
+**题目描述：**
+
+现有n个编译项，编号为0 ~ n-1。给定一个二维数组，表示编译项之间有依赖关系。如[0, 1]表示1依赖于0。
+
+若存在循环依赖则返回空；不存在依赖则返回可行的编译顺序。
+
+**题目分析：**
+
+若给定一个依赖关系是[[0,2],[1,2],[2,3],[2,4]]，如图所示
+
+![图片](https://mmbiz.qpic.cn/mmbiz_png/oD5ruyVxxVHOSu5k160b070ZdrAMyjL3by5C0ju2jsLq9VlxOmDXArYaYSoP6LC0WqP9VUaAfONbICrlV8Y9vQ/640?wx_fmt=png&tp=webp&wxfrom=5&wx_lazy=1&wx_co=1)
+
+可以看出，它们之间不存在循环依赖。
+
+可行的编译序列是[0,1,2,3,4]，也可以是[1,0,2,4,3]等。
+
+拓扑排序可以求这样的一个序列。可以看出，这个序列结果可能不唯一。
+
+> > 拓扑排序算法过程：
+> >
+> > 1. 选择图中一个入度为0的点，记录下来
+> > 2. 在图中删除该点和所有以它为起点的边
+> > 3. 重复1和2，直到图为空或没有入度为0的点。
+
+```java
+vector<int> haveCircularDependency(int n, vector<vector<int>> &prerequisites) {
+    vector<vector<int>> g(n); //邻接表存储图结构
+    vector<int> indeg(n); //每个点的入度
+    vector<int> res; //存储结果序列
+    for(int i = 0; i < prerequisites.size(); i ++) {
+        int a = prerequisites[i][0], b = prerequisites[i][1]; 
+        g[a].push_back(b);
+        indeg[b] ++;
+    }
+    queue<int> q;
+    //一次性将入度为0的点全部入队
+    for(int i = 0; i < n; i ++) {
+        if(indeg[i] == 0) q.push(i);
+    }
+    while(q.size()) {
+        int t = q.front();
+        q.pop();
+        res.push_back(t);
+        //删除边时，将终点的入度-1。若入度为0，果断入队
+        for(int i = 0; i < g[t].size(); i ++) {
+            int j = g[t][i];
+            indeg[j] --;
+            if(indeg[j] == 0) {
+                q.push(j);
+            }
+        }
+    }
+    if(res.size() == n) return res;
+    else return {};
+}
+```
+
+
+
+### 6.最小生成树-NC159最小生成树(Kruskal算法)
+
+**描述**
+
+一个有n户人家的村庄，有m条路连接着。村里现在要修路，每条路都有一个代价，现在请你帮忙计算下，最少需要花费多少的代价，就能让这n户人家连接起来。
+
+**示例1**
+
+输入：
+
+```
+3,3,[[1,3,3],[1,2,1],[2,3,1]]
+```
+
+复制
+
+返回值：
+
+```
+2
+```
+
+```java
+import java.util.*;
+
+
+public class Solution {
+    /**
+     * 代码中的类名、方法名、参数名已经指定，请勿修改，直接返回方法规定的值即可
+     *
+     * 返回最小的花费代价使得这n户人家连接起来
+     * @param n int n户人家的村庄
+     * @param m int m条路
+     * @param cost int二维数组 一维3个参数，表示连接1个村庄到另外1个村庄的花费的代价
+     * @return int
+     */
+    public int miniSpanningTree (int n, int m, int[][] cost) {
+        // write code here
+        int[] parent = new int[n+1];
+        for(int i=0;i<parent.length;i++){
+            parent[i] = i;
+        }
+        //优先级队列
+        PriorityQueue<Node> queue = new PriorityQueue<>((a,b)->(a.cost-b.cost));
+        for(int[] c:cost){
+            queue.offer(new Node(c[1],c[0],c[2]));
+        }
+        int res = 0;
+        while(!queue.isEmpty()){
+            Node cur = queue.poll();
+            if(find(parent,cur.start)!=find(parent,cur.end)){
+                res += cur.cost;
+                union(parent,cur.start,cur.end);
+            }
+        }
+        return res;
+    }
+    // 结点
+    static class Node{
+        int start;
+        int end;
+        int cost;
+        public Node(int s,int e,int c){
+            this.start = s;
+            this.end = e;
+            this.cost = c;
+        }
+    }
+    
+     public int find(int[] parent,int node){
+           while(node!=parent[node]){
+               parent[node] = parent[parent[node]];
+               node = parent[node];
+           }
+           return node;
+        }
+        public void union(int[] parent,int node1,int node2){
+            int p1 = find(parent,node1);
+            int p2 = find(parent,node2);
+            parent[p1] = p2;
+        }
+}
+```
+
+### 7.KMP算法
+
+**描述**
+
+给你一个非空模板串S，一个文本串T，问S在T中出现了多少次
+
+**示例1**
+
+输入：
+
+```
+"ababab","abababab"
+```
+
+复制
+
+返回值：
+
+```
+2
+```
+
+复制
+
+**示例2**
+
+输入：
+
+```
+"abab","abacabab"
+```
+
+复制
+
+返回值：
+
+```
+1
+```
+
+对原生kmp做个改造
+
+主要两点：
+
+1. next数组多算一格
+2. kmp匹配时，如果完全匹配上，则ans计数+1， 并让模式串移动到next[ti]位置
+
+```java
+import java.util.*;
+
+
+public class Solution {
+    /**
+     * 代码中的类名、方法名、参数名已经指定，请勿修改，直接返回方法规定的值即可
+     *
+     * 计算模板串S在文本串T中出现了多少次
+     * @param S string字符串 模板串
+     * @param T string字符串 文本串
+     * @return int整型
+     */
+     public int kmp (String S, String T) {
+        // write code here
+        int[] next = getNext(S);
+        char[] str =T.toCharArray();
+        char[] t = S.toCharArray();
+        int si =0;
+        int ti =0;
+
+        int ans =0;
+        while(si < str.length){
+            if(ti==-1 || str[si] == t[ti]){
+                si++;
+                ti++;
+            }else{
+                ti = next[ti];
+            }
+            if(ti == t.length){  //改造2
+                ans++;
+                ti=next[ti];
+            }
+        }
+        return ans;
+    }
+
+    public int[] getNext(String S){
+        char[] str= S.toCharArray();
+        int[] next=  new int[str.length+1]; //改造1
+        next[0]=-1;
+        next[1] = 0;
+        int cur=2;
+        int x = next[cur-1];
+        while(cur<=str.length){
+            if(x==-1 || str[cur-1]==str[x]){
+                next[cur++] = ++x;
+            }else{
+                x=next[x];
+            }
+        }
+        return next;
+    }
+}
+```
+
+
+
+### [3.排列11223344的问题](https://leetcode-cn.com/circle/discuss/aHLvHV/)
+
+有8个数，11223344
+将其排列，要求结果满足：两个1之间有一个数，两个2之间有两个数，两个3之间有三个数，**两个4之间有四个数。**问这个结果是多少？
+
+答案：41312432 或 23421314
+
+可以想到，先填 4 比较好，因为填 4 可能的方案最少。
+
+如图所示，在最终答案中，4 的位置一定是以下三种方案之一。
+
+![image.png](imgs\470.png)
+
+由于方案 1 和方案 3 只是顺序不同，因此我们可以只考虑方案1，如果最后以方案1为开始找到了答案，逆序一下便是方案3能找到的答案。
+
+因此，我们只需考虑方案 1 和方案 2 。
+
+同理，按照上面的思路，再填 3 ，再填 2 ，最后填 1 。
+
+最终便可搜索到答案。
+
+下图是以方案 1 开始搜索的所有可能方案，最终得到结果41312432；将其逆序得到的23421314，依然满足结果。
+
+![image-20210715231532644](imgs\471.png)
+
+大家可以在纸上写一下，看看和我图中的一不一致。
+
+由方案 2 开始搜索无法得到满足条件的序列，因此不再画图分析。
+
+### 5.灯泡开关
+
+一个圆环上有 100 个灯泡，灯泡有亮和暗两种状态。按一个灯泡的开关可以改变它和与它相邻两个灯泡的状态。
+设计一种算法，对于任意初始状态，使所有灯泡全亮。
+
+将灯泡编号 1 ~ 100
+
+**步骤一：将灯泡变为全亮或只剩一个为暗**
+
+从 1 循环到 98 ，**遇到暗**的则按它下一个，使之变亮。循环完毕，1 ~ 98 必然全亮。**99 和 100可能为亮亮、暗亮、亮暗、暗暗四种状态。**
+
+若为亮亮，皆大欢喜，满足题目要求
+**暗亮、亮暗，达到只剩一个为暗的状态**；
+若为**暗暗**。则按下编号 100 的灯泡，使编号 99 、100 变为亮，**编号 1 的灯泡变为暗，从而达到只剩一个为暗的状态。**
+
+**步骤二：将灯泡变为全暗**
+
+由于灯泡环形摆放，我们指定暗的灯泡编号为 1 ，将剩下 99 个亮着的灯泡每 3 个为一组。按下每组中间的灯泡后，使得所有灯泡变为暗。
+
+**步骤三：将灯泡变为全亮**
+
+将所有灯泡按一下，灯泡变为全亮。
+
+
+
+对于 N 个灯泡的任意初始状态 ( N > 3 ) ，能否经过若干次操作使得所有灯泡全亮？
+
+答案：N 个灯泡做分类讨论。
+
+N = 3*k+1一定可以。方法与上述步骤相同，在步骤二中可以将3k个亮的灯泡分为k组。
+N = 3*k+2一定可以。将上述步骤一目标状态的只剩一个为暗改成剩两个相邻为暗，其余 3 * k 个灯泡分组按即可。因为，对于任意只剩一个为暗的状态，按下该灯泡左右任意一个就可以变成剩两个相邻为暗的状态！
+N = 3*k不一定。如果经过上述步骤一可以将灯泡变成全亮的状态则有解；否则，无解。（该结论有待证明）
+
+
+
+### [12.圆环会原点问题](https://leetcode-cn.com/circle/discuss/TWO4Z5/)
+
+圆环上有10个点，编号为0~9。从0点出发，每次可以逆时针和顺时针走一步，问走n步回到0点共有多少种走法。
+
+输入: 2
+输出: 2
+解释：有2种方案。分别是0->1->0和0->9->0
+
+**题目分析：**
+
+本题考察的是动态规划。
+如果你之前做过[LC.70爬楼梯](https://leetcode-cn.com/problems/climbing-stairs/)，则会比较容易理解这题的解法：走n步到0的方案数=**走n-1步到1的方案数**+**走n-1步到9的方案数。**
+
+![image-20210716094606060](imgs\477.png)
+
+```java
+class Solution:
+    def backToOrigin(self,n):
+        #点的个数为10
+        length = 10
+        dp = [[0 for i in range(length)] for j in range(n+1)]
+        dp[0][0] = 1
+        for i in range(1,n+1):
+            for j in range(length):
+                #dp[i][j]表示从0出发，走i步到j的方案数
+                dp[i][j] = dp[i-1][(j-1+length)%length] + dp[i-1][(j+1)%length]
+        return dp[n][0]
+
+```
+
+### 13.区间和*区间最小值的最大值是多少
+
+挑选一个区间，区间值为区间和乘以区间内最小的数的值，求区间值最大的区间（2021.1 字节跳动-国际化-前端）
+无序数组，求一个值最大的区间，区间计算方案为：区间和 * 区间最小值（2020.09 字节跳动-电商-后端）
+[3,1,6,4,5,2]，对于任意子序列可以计算一个X值，X=sum(subArray) * min(subArray)，求最大X（2020.07 字节跳动-商业化-前端）
+
+**题目分析：**
+
+给定一个数组，要求选出一个区间, 使得该区间是所有区间中经过如下计算的值最大的一个：区间中的最小数 * 区间所有数的和。
+
+数组中的元素都是非负数。
+
+输入两行，第一行n表示数组长度，第二行为数组序列。输出最大值。
+
+输入
+3
+6 2 1
+输出
+36
+解释：满足条件区间是[6] = 6 * 6 = 36;
+
+**题目分析**
+
+**方法一：暴力。**题目是找max(区间和 * 区间最小值)，而满足的区间最小值一定是数组的某个元素。因此可以枚举数组，枚举时每个元素（设为x）作为区间最小值，在x左右两侧找到第一个比x小的元素，分别记录左右边界的下标为l,r，寻找边界时计算当前区间的和。那么以x为区间最小值的最大计算区间一定是[l+1,r-1]区间和*x。整个算法的时间复杂度是O(N²)。
+
+**方法二：单调栈。**方法一中找每个元素左右边界的复杂度是O(N)，通过单调栈的数据结构可以将其优化为O(1),因此优化后整个算法的时间复杂度可以达到O(N)。
+
+```java
+//单调栈，时间复杂度O(N)
+#include <iostream>
+#include <vector>
+#include <stack>
+using namespace std;
+const int N = 500000+10;
+int a[N];
+int dp[N];
+stack<int> s;
+int main()
+{
+    int n,res=0;
+    cin >> n;
+    for(int i = 0; i < n; i ++) cin >> a[i];
+    //前缀和便于快速求区间和，例如求[l,r]区间和=dp[r+1]-dp[l]。l和r的取值范围是[0,n)
+    for(int i = 1; i <= n; i ++) dp[i] = dp[i-1] + a[i-1]; 
+    for(int i = 0; i < n; i ++) {
+        while(!s.empty() && a[i] <= a[s.top()]) {
+            int peak = a[s.top()];
+            s.pop();
+            int l = s.empty()? -1 : s.top();
+            int r = i; 
+            //l和r是边界，因此区间是[l+1,r-1]，其区间和dp[r+1]-dp[l]
+            int dist = dp[r] - dp[l+1];
+            res = max(res,peak*dist);
+        }
+        s.push(i);
+    }
+    while(!s.empty())
+    {
+        int peak = a[s.top()];
+        s.pop();
+        int l = s.empty()? -1 : s.top();
+        int r = n; 
+        
+        int dist = dp[r] - dp[l+1];
+        res = max(res,peak*dist);
+    }
+    cout << res << endl; 
+}
+
+```
+
+### 14.磁盘剩余空间最小
+
+- 某一个大文件被拆成了N个小文件，每个小文件编号从0至N-1，相应大小分别记为S(i)。给定磁盘空间为C，试实现一个函数从N个文件中**连续选出若干个文件**拷贝到磁盘中，使得磁盘剩余空间最小。
+
+滑动窗口 ：每次记录窗口内的总和，和小于C，记录剩余空间，再窗口右端右移，和大于C，就窗口左端右移，小于C情况下比较剩余空间取最小值。
+
+```java
+public class Solution {
+    public int[] findMin(int[] s,int c){
+        int i = 0;
+        int j = 0;
+        int minValue = Integer.MAX_VALUE;
+        int sum = 0;
+        int left = 0;
+        int right = 0;
+        while(j <= s.length){
+            if(sum <= c){
+               j++;
+               sum += s[j];
+               minValue = Math.min(minValue,c - sum);
+               if(minValue == c - sum){
+                   left = i;
+                   right = j;
+               }
+            }else{
+                i++;
+                sum -= s[i];
+            }
+        }
+        int nums = new int[right - left];
+        for(int k = left;k < right;k++){
+            nums[k - left] = s[k];
+        }
+        return nums;
+    }
+}
+```
+
+
+
+### 25.给一个0-4随机数生成器，如何生成0-6随机数
+
+这个题的难点在于如何保证 数字出现的概率都是相等 的 **。**
+
+0-6通过对7取余可以得到，那么就想办法凑对7取余的场景。
+
+```java
+public class Frequency {
+    public static int rand7(){
+        while(true){
+            int num=5*rand5()+rand5();//0-24
+            if(num<21)
+                return num % 7;
+        }
+    }
+}
+```
+
+```java
+
+
+//变形：如果用0-6随机生成器生成0-9随机数
+public class Frequency {
+    public static int rand10(){
+        while(true){
+            int num=7*rand7()+rand7();
+            if(num<41)
+            //排除41-48，因为他们不能生成9，会造成各个数字出现的概率不同
+                return num % 10;
+        }
+    }
+}
+```
+
+### 29.剑指Offer62 圆圈中最后剩下的数字
+
+ 
+
+0,1,···,n-1这n个数字排成一个圆圈，从数字0开始，每次从这个圆圈里删除第m个数字（删除后从下一个数字开始计数）。求出这个圆圈里剩下的最后一个数字。
+
+例如，0、1、2、3、4这5个数字组成一个圆圈，从数字0开始每次删除第3个数字，则删除的前4个数字依次是2、0、4、1，因此最后剩下的数字是3。
+
+ 
+
+示例 1：
+
+输入: n = 5, m = 3
+输出: 3
+示例 2：
+
+输入: n = 10, m = 17
+输出: 2
+
+```java
+class Solution {
+    public int lastRemaining(int n, int m) {
+        // 用List来做
+        List<Integer> list = new ArrayList<>();
+        for(int i=0;i<n;i++){
+            list.add(i);
+        }
+        // 第一个的索引是
+        int index = 0;
+        while(list.size()>1){
+            // 开始
+            for(int i=1;i<m;i++){
+                index = (index+1)%list.size();
+            }
+            list.remove(index);
+        }
+        return list.get(0);
+    }
+}
+```
+
+### 32.下面代码输出什么
+
+```java
+public static void main(String[] args) {
+		Map<Short, String> map = new HashMap<>(); 
+		for(short i = 0; i <100; i++) {
+		     map.put(i, String.valueOf(i));
+		     map.remove(i-1);
+		}
+		System.out.println(map.size());
+	}
+```
+
+### 排列11223344 问题
+
+有8个数，11223344
+将其排列，要求结果满足：两个1之间有一个数，两个2之间有两个数，两个3之间有三个数，两个4之间有四个数。问这个结果是多少？
+
+答案：41312432 或 23421314
+
+我们可以想象成有 8 个空格子，依次往里填数字，填的时候满足题目的要求，最终得到的结果便是问题的答案。
+
+可以想到，先填 4 比较好，因为填 4 可能的方案最少。
+
+如图所示，在最终答案中，4 的位置一定是以下三种方案之一。
+
+![image.png](https://pic.leetcode-cn.com/1623844218-hpiqVz-image.png)
+
+
+由于方案 1 和方案 3 只是顺序不同，因此我们可以只考虑方案1，如果最后以方案1为开始找到了答案，逆序一下便是方案3能找到的答案。
+
+因此，我们只需考虑方案 1 和方案 2 。
+
+同理，按照上面的思路，再填 3 ，再填 2 ，最后填 1 。
+
+最终便可搜索到答案。
+
+下图是以方案 1 开始搜索的所有可能方案，最终得到结果41312432；将其逆序得到的23421314，依然满足结果。
+
+![image.png](https://pic.leetcode-cn.com/1623844265-SzlxjL-image.png)
+
+大家可以在纸上写一下，看看和我图中的一不一致。
+
+由方案 2 开始搜索无法得到满足条件的序列，因此不再画图分析。
+
+
+
+
+
+## 智力题
+
+### 1.抛硬币，谁胜公平的问题？
+
+**一硬币，一面向上概率0.7，一面0.3，如何公平？**
+
+>  抛两次， **正反** A胜， **反正** B胜。
+
+
+
+**两个人轮流抛硬币，先抛到正面的赢，问先抛的人赢的概率**
+
+2/3
+
+每一轮 抛硬币，A先抛赢得概率是1/2，B后抛赢得概率是（1/2）*（1/2）= 1/4。那么 每一轮A赢得概率都是B赢得概率的2倍 ，总概率为1,所以A赢的概率是2/3。
+
+### 2.烧香判断时间的问题？
+
+- 两根香，一根烧完1小时，如何测量15分钟
+
+开始时一根香两头点着，一根香只点一头，两头点着的香烧完说明过去了半小时，这时将只点了一头的香另一头也点着，从这时开始到烧完就是15分钟。
+
+### 3.博弈论：海盗分金币的问题
+
+5个海盗抢得100枚金币，他们按抽签的顺序依次提方案：首先由1号提出分配方案，然后所有5人表决(包括自己)，超过半数同意方案才被通过，否则他将被扔入大海喂鲨鱼，依此类推。
+
+**两个海盗--毫无悬念**
+
+> 结果 (0, 100)
+
+**三个海盗--无奈的选择**
+
+当存在三个海盗的时候,原来的两个海盗时的一号变成了二号,此时二号知道了,如果一号被投死,那么毫无悬念的,他没有任何活路,根据==贪生怕死==的原则,他会无论如何保全自己,换句话说,他无论如何都会同意此时一号的题意,那么此时聪明的一号知道他们的想法之后就开心的不行了,因为无论自己提什么条件自己都会得到半数以上的投票.那根据==贪得无厌==的原则,结果显而易见.
+
+> 结果 (100, 0, 0)
+
+**四个海盗--稍稍讨好就可以**
+
+四个海盗时,此时的一号明白了此时的二号是讨好不了的.因为自己死了二号就一定能得到全部100枚金币,所以干脆不讨好,给他0枚金币吧.而此时除了自己的票还差两票,那么只要讨好三号和四号获得这两票就好,三号和四号相当容易讨好的,因为一号死了,他们就只能得到空气(三个海盗的结果为(100, 0, 0)),那么给他一块金币就好啦.当然一号不能不给三号四号金币,因为海盗都是==心狠手辣==的,==[如果不管你死不死我都是0块金币,那我干脆要你死算了]==.
+
+> > 结果 (98, 0, 1, 1)
+
+**五个海盗--照本宣科**
+
+相同的原理,现在的一号需要2票就能保证存活,首先二号是不考虑了给金币了,不管给多少都反对的,三号给一个金币就行,然后还差一票,只要给==四号或五号==其中一个两枚金币,另一个不给,就可以.但这里要注意一下,此时的分歧已经产生,后面的推广推理中会用到.
+
+> 结果: (97, 0, 1, 2, 0)或(97, 0, 1, 0, 2)
+
+**推广的思路**
+
+同样的思路推广下去我们会发现这样的规律:
+
+> 当 n为偶数时只要给二号到n号0,1,0,1...0,1,0,1,1
+>  当 n 为奇数时给1,x,1,x....x,x.(任意一个x是二其余都是0)
+
+上述情况的答案都是m-n/2
+
+### 4.赛马问题
+
+- **64匹马，8个跑道，选跑最快的4匹马需要比赛多少次。** 
+
+​      (     锦标赛[排序]()[算法]()     )      sum = 11     
+
+​      第一步：首先每8匹马跑一次，总共需要8次，假设结果中A1>A2>A3>......,B1>B2>B3>....等。 sum=8；     
+
+​      第二步：这8组中的第一名拉出来跑一次，那么这次最快的是总的第一名，假设是A1，同时假设B1>C1>D1。这时还要角逐2,3,4名，     那这一轮中的第五到第八组都可以直接舍弃     ，因为他们所有的马一定进不了前4名。sum=9。     
+
+​      第三步：从A组中选A2，A3，A4，B组中B1，B2，B3，C组中C1，C2，D组中D1，这些才有资格角逐2,3,4名。这时需要再比赛两次。 sum=11。（但是如果第10轮选择A4不上场，如果A3获得了第4名，那么A4就不需要比赛了，这样     sum=10     ）。
+
+解答：
+
+一般想法是将球镜像对称，但这道题是把洞镜像对称
+
+将这个桌面在这个平面无限延展，可类比成无限张球桌紧密放置
+
+那么每一个和球洞的连线都是合法路径
+
+### 5.大小王在一份的概率
+
+**54张扑克牌，平均分成3份，大小王在一份的概率**
+
+首先大王一定会在某一份中，然后要计算这一份中还要包含小王的概率。去掉大王还剩53张牌，这一份还可以分17张牌，那么每次分到小王的概率是1/53,所以总概率是17/53。
+
+![image-20210716160902821](imgs\478.png)
+
+### 场景设计题
+
+#### 1.红包分发
+
+**让你设计一个微信发红包的api，你会怎么设计，不能有人领到的红包里面没钱，红包数值精确到分。**
+
+**a.所有人抢到金额之和等于红包金额，不能超过，也不能少于。**
+
+**b.每个人至少抢到一分钱。**
+
+**c.要保证所有人抢到金额的几率相等。**
+
+> 解题思路：线段切割法
+
+何谓线段切割法？我们可以把红包总金额想象成一条很长的线段，而每个人抢到的金额，则是这条主线段所拆分出的若干子线段。
+
+![image-20210716161506487](imgs\479.png)
+
+如何确定每一条子线段的长度呢？由“切割点”来决定。当N个人一起抢红包的时候，就需要确定N-1个切割点。
+
+
+
+因此，当N个人一起抢总金额为M的红包时，我们需要做N-1次随机运算，以此确定N-1个切割点。**随机的范围区间是（1， M）**。
+
+
+
+当所有切割点确定以后，子线段的长度也随之确定。这样每个人来抢红包的时候，只需要顺次领取与子线段长度等价的红包金额即可。
+
+```java
+public class Hongbao {
+ 
+    public static double getRandomMoney(Redpackage redpackage){
+        if (redpackage.redpackage_size == 1){
+            redpackage.redpackage_size--;
+            return (double) Math.round(redpackage.redpackage_money*100)/100;
+        }
+ 
+        Random r = new Random();
+//      设置每次发红包的最小值
+        double min = 0.01;
+//      控制当前发红包的最大值
+        double max = redpackage.redpackage_money/redpackage.redpackage_size * 2;
+//      用随机数与当前发红包的最大钱数相乘，算出当前要发的红包
+        double money = r.nextDouble() * max;
+//      如果当前发红包的钱小于0.01则，赋值为0.01（规范当前红包最小值）
+        money = money <= min?0.01:money;
+//      统计为小数点后两位
+        money = Math.floor(money*100)/100;
+        redpackage.redpackage_size--;
+        redpackage.redpackage_money -= money;
+//      发红包
+        return money;
+    }
+    static class Redpackage{
+        double redpackage_money ;
+        double redpackage_s
+```
+
+#### 2.关注如何设计
+
+**谁关注了我，我关注了谁，谁与我互相关注。表该如何设计，索引怎么建。查询语句怎么写**
+
+粉丝关注表使用四列，主键id，userId，fansId，是否互相关注。用两行数据来保存互相的关注关系，这样查询起来更方便，用空间换时间。
+
+主键有主键索引，剩下的字段不适合建索引，因为字段重复太多。
+
+#### 3.扫码登录是如何设计的？
+
+**(1) 网页端+服务器**
+
+首先，大概说一下原理：用户打开网站的登录页面的时候，向浏览器的服务器发送获取登录二维码的请求。服务器收到请求后，随机生成一个uuid，将这个id作为key值存入redis服务器，同时设置一个过期时间，再过期后，用户登录二维码需要进行刷新重新获取。同时，将这个key值和本公司的验证字符串合在一起，通过二维码生成接口，生成一个二维码的图片（二维码生成，网上有很多现成的接口和源码，这里不再介绍。）然后，将二维码图片和uuid一起返回给用户浏览器。
+
+浏览器拿到二维码和uuid后，会每隔一秒向浏览器发送一次，登录是否成功的请求。请求中携带有uuid作为当前页面的标识符。这里有的同学就会奇怪了，服务器只存了个uuid在redis中作为key值，怎么会有用户的id信息呢？ 
+
+这里确实会有用户的id信息，这个id信息是由手机服务器存入redis中的。具体操作如下：
+
+**（2）手机端+服务器**
+
+话说，浏览器拿到二维码后，将二维码展示到网页上，并给用户一个提示：请掏出您的手机，打开扫一扫进行登录。用户拿出手机扫描二维码，就可以得到一个验证信息和一个uuid（扫描二维码获取字符串的功能在网上同样有很多demo，这里就不详细介绍了）。由于手机端已经进行过了登录，在访问手机端的服务器的时候，参数中都回携带一个用户的token，手机端服务器可以从中解析到用户的userId（这里从token中取值而不是手机端直接传userid是为了安全，直接传userid可能会被截获和修改，token是加密的，被修改的风险会小很多）。手机端将解析到的数据和用户token一起作为参数，向服务器发送验证登录请求（这里的服务器是手机服务器，手机端的服务器跟网页端服务器不是同一台服务器）。服务器收到请求后，首先对比参数中的验证信息，确定是否为用户登录请求接口。如果是，返回一个确认信息给手机端。
+
+手机端收到返回后，将登录确认框显示给用户（防止用户误操作，同时使登录更加人性化）。用户确认是进行的登录操作后，手机再次发送请求。服务器拿到uuId和userId后，将用户的userid作为value值存入redis中以uuid作为key的键值对中。
+
+### 4.大数据类场景题
+
+#### 4.1 1亿个正整数,范围是0-42亿。求出现次数是2的数字，空间复杂度 
+
+​      使用位图bitMap     。位图是以     bit     位为单位进行数据存储，这样每个字节8个位就可以存储8个数字，普通的一个int占4个字节，32位，用了位图之后可以将空间节省32倍。     
+
+​      开一个42亿大小的位图，将这一亿个数字存进数字大小对应的位置，一个bit每存进去一个数字，就将value+1,比如第一次存8，就将索引为8的位置的value置为1，第二次就置为2，存完之后搜索value为2的key是多少。     
+
+​      **32位机器最大能表示的数字是42亿9千多万。**     
+
+​      42亿bit /(8*1024*1024) = 500MB 
+
+#### 4.2 **有一个IP地址库，假设有几十万条ip，如何判断某个ip地址是否在这个库中？**
+
+思路一：分治法，将ip地址根据前三位分成256份，然后看这个ip地址对应的网段，只比对这个网段里面是否有这个ip，当然还可以继续分下去，根据数据量来决定分成多少份。     
+
+​      思路二：位图，将每一条ip对应位图中的一个位，2^32次方(42亿多)个数据只需要512M空间。可以实现O(1)的时间搜索，O(n)的时间存储。
+
+
+
+### 5.扑克牌同花顺的概率
+
+**一副牌去掉大小鬼52张，抽13张，任意取5张能组成同花顺的概率？**
+
+我觉得是 40＊C(52-5, 13-5)/C(52, 13)。
+
+解释：从52张中选13张，所有可能为C(52,13)。
+在这13张中有5张构成同花顺，这对应上式中的因子40。
+此外13张中还有额外的8张，因此还需要从（52－5）中选出8张牌，
+这对应分子上的因子C(52-5, 13-5)。
+
+![image-20210716162759764](imgs\480.png)
+
+![image-20210716162834776](imgs\481.png)
+
+## 面试相关
+
+1.自我介绍
+
+2.你做过的这些项目里面你觉得你最有成就感的是哪一个？你解决了什么问题，你在项目里面负责哪样的工作
+
+人工智能的生产应用，将其落地了。与之前长做的一些开发工作进行了融合；
+
+一个是海尔智慧工厂项目中的多线程读取的工作；
+
+另外一个印象深刻的是影像图模块中，我们有一个tif图片上传的功能
+
+
+
+3.你在做过的项目里面有用到设计模式吗？常见的设计模式有哪些？
+
+
+
+4.项目中你如何保证多线程的并发工作？怎么做？
+
+
+
+5.你了解 过concurrenthashmap？currenthashmap是如何保证多线程工作的？
+
+
+
+6.给你实际的应用场景，有一个论坛，其中有一个用户发帖量很高，超过了其它用户的一半，你有一个list，里面包含了id和发帖量，如何最快速的找出来？(找水王的问题)
+
+读取前两个帖子发帖人的id，比较，如果不同，全部丢弃；接着再读取之后两个id，如果相同，丢弃一个，读取后面一个；依次类推，直到读取并比较完所有id，剩下的最后一个id就是“水王”的id。**重点是最快，把这串数字放到一个数组里面，两个相邻的数字去做比较，如果相等，在向后比较，如果不等把这两个数字都置为0，标明这两个数字已经相互抵消。水王的数字最多，最后数组里面只有水王的数字。**
+
+7.给你个实际应用 场景，网络中有一个待下载的文件，你需要将其下载存在磁盘当中，如何快速最优的？
+
+一个读线程一个写线程；
+
+利用`RandomAccessFile`在本地创建一个随机访问文件，文件大小和服务器要下载的文件大小相同。根据线程的数量(假设有三个线程)，服务器的文件三等分，并把我们在本地创建的文件同样三等分，每个线程下载自己负责的部分，到相应的位置即可。
+
+```
+1、服：利用ServerSocket搭建服务器，开启相应端口，进行长连接操作
+2、服：使用ServerSocket.accept()方法进行阻塞，接收客户端请求
+3、服：每接收到一个Socket就建立一个新的线程来处理它
+4、客：利用Socket进行远程连接，询问已上传进度
+5、客：使用FileInputStream.skip(long length)从指定位置读取文件，向服务器发送文件流
+6、服：接收客户端输入流，使用RandomAccessFile.seek(long length)随机读取，将游标移动到指定位置进行读写
+7、客/服：一个循环输出，一个循环读取写入
+8、示例：以下是具体代码，仅供参考
+```
+
+https://www.cnblogs.com/austinspark-jessylu/p/8745640.html
+
+8.反问问题：部门业务
+
+9.项目相关的知识
+
+相关文档有：
+
+- 概要设计：系统设计思想 系统模块的设计  流程图以及ER图
+- 需求分析：**功能需求、非功能需求  用例图**
+- 调试流程：测试主要按阶段分类：**单元测试**、**集成测试**、**系统测试**以及**最终的验收测试**。
+
+10. 项目中的同源策略是什么？
+
+**同源策略要求源相同才能正常通信，即协议、域名、端口都完全一致才可以。**
+
+游览器处于安全的考虑，使用XMLHttpReqest对象发起HTTP请求时必须遵守同源策略，否则就是跨域的HTTP请求，默认情况是被禁止。
+
+而要想解决跨域问题有一个 **CORS**的W3C标准，允许游览器向跨源服务器，发出XMLHTTPRequest请求。**实质上是通过在服务器增加一个特殊的Header（Access-Controll-Allow-Origin）来告诉客户端跨域的限制，如果游览器支持CORS，并且判断origin通过的话。**
+
+**具体项目实现的话，通过增加了一个配置类，实现Filter接口，在httpservletresponse上添加addheader即access-control-allow-orgin就可。 接口调用时，会过滤跨域的拦截。**
+
+#### 11.**项目中的数据库表的设计**
+
+首先是申请单的设计
+
+`requisition`表
+
+requisition_id：申请单的主键id，int类型；
+
+requisition_name: 申请单的名称比如AJ006J，varchar类型；
+
+requisition_construcunit：申请单的车间，varchar；
+
+requisition_weldingmethod: 焊接方法， varchar类型 ；
+
+requisition_testingstandard：检测标准，varchar类型；
+
+requisition_qualificationlevel: 合格级别 varchar类型；
+
+requisition_firstexam: 一级状态 varchar 未审批 审批完成之类的；
+
+requisition_entrytime:创建时间 time类型
+
+
+
+`picture`表
+
+picture_id: 图片的主键，int类型；
+
+picture_number:图片的名称，varchar类型；
+
+picture_dir: 图片的存储路径，varchar类型；
+
+picture_level: 图片的等级 varchar类型；I级
+
+picture_width：图片的宽度int；
+
+picture_height: 图片的高度int；
+
+
+
+`polygon`表
+
+polygon_id: 缺陷的主键 int类型；
+
+polygon_pt: 一个缺陷点的所有坐标xy xy之类的 varchar类型
+
+polygon_text_x:最上角的h int类型；
+
+polygon_text_y:最上角的w  int类型；
+
+polygon_picture_id:这个缺陷所属于的picture的id
+
+polygon_author: 这个缺陷是用ai还是人工标注的；
+
+polygon_damage_type:这个缺陷的类型是什么
+
+
+
+`demage_type`表
+
+demagetype_id: 缺陷的类型
+
+demagetype_name: 缺陷的名字
+
+
+
+未确定；条形缺陷；未焊透；未熔合；裂纹；圆形缺陷
+
+
+
+#### token
+
+##### 0.token的起源
+
+在介绍基于Token的身份验证的原理与优势之前，不妨先看看之前的认证都是怎么做的。
+
+基于服务器的验证
+
+我们都是知道HTTP协议是无状态的，这种无状态意味着程序需要验证每一次请求，从而辨别客户端的身份。
+
+在这之前，程序都是通过在服务端存储的登录信息来辨别请求的。这种方式一般都是通过存储Session来完成。
+
+随着Web，应用程序，已经移动端的兴起，这种验证的方式逐渐暴露出了问题。尤其是在可扩展性方面。
+
+基于服务器验证方式暴露的一些问题
+
+- Seesion：每次认证用户发起请求时，服务器需要去创建一个记录来存储信息。当越来越多的用户发请求时，内存的开销也会不断增加。
+
+- 可扩展性：在服务端的内存中使用Seesion存储登录信息，伴随而来的是可扩展性问题。
+
+- CORS(跨域资源共享)：当我们需要让数据跨多台移动设备上使用时，跨域资源的共享会是一个让人头疼的问题。在使用Ajax抓取另一个域的资源，就可以会出现禁止请求的情况。 
+
+- CSRF(跨站请求伪造)：用户在访问银行网站时，他们很容易受到跨站请求伪造的攻击，并且能够被利用其访问其他的网站。
+
+在这些问题中，可扩展行是最突出的。因此我们有必要去寻求一种更有行之有效的方法。
+基于Token的身份验证是无状态的，我们不将用户信息存在服务器或Session中。
+
+这种概念解决了在服务端存储信息时的许多问题
+
+NoSession意味着你的程序可以根据需要去增减机器，而不用去担心用户是否登录。
+
+基于Token的身份验证的过程如下:
+
+- 用户通过用户名和密码发送请求。
+
+- 程序验证。
+
+- 程序返回一个签名的token 给客户端。 
+
+- 客户端储存token,并且每次用于每次发送请求。
+
+- 服务端验证token并返回数据。
+
+- 每一次请求都需要token。token应该在HTTP的头部发送从而保证了Http请求无状态。我们同样通过设置服务器属性Access-Control-Allow-Origin:* ，让服务器能接受到来自所有域的请求。
+  
+
+##### 1.什么是token
+
+ token即为令牌，是服务器生成的一串字符串，作为客户端向服务器进行请求的“通行证”。在客户端进行初次登陆后由服务器返回，之后的每次请求只需要携带token进行请求即可，而无需携带密码等敏感信息
+
+##### 2.场景设置
+
+ 在基于token验证登录态这个情境下，可以想象一个场景，你在使用app或者在网页上进行操作时，你的token突然就过期了，然后只好被迫停止现在正在进行的操作跳转到登录页进行重新登录操作，这就非常的智熄了，这带给用户，特别是经常使用或正在进行某个操作的用户，一种非常不好的体验。这就是单token验证登录的一个缺点。因此对于经常/正在使用或经常/正在进行操作的用户（我称之为活跃用户）就不应当跳转到登录页面进行登陆操作（除了某些敏感系统或包含敏感信息进行敏感操作的网页、app、系统），对于这个缺点的解决，这里介绍一个双token的验证机制
+
+##### 3.何为双token验证
+
+ 顾名思义，就是在登陆操作之后由服务端返回两个token：accessToken和refreshToken，在之后的验证登录态的操作中使用这两个token进行验证，其中accessToken的过期时间相当短，refreshToken的过期时间相对于accessToken而言相当长，且会不断的刷新，每次刷新后的refreshToken都是不同的
+
+##### 5.双token校验流程
+
+ 首先进行正常的登录操作，在后台服务器验证账号密码成功之后返回2个token：accessToken和refreshToken。在进行服务器请求的时候，先将Token发送验证，如果accessToken有效，则正常返回请求结果；如果accessToken无效，则验证refreshToken。此时如果refreshToken有效则返回请求结果和新的accessToken和新的refreshToken。如果refreshToken无效，则提示用户进行重新登陆操作。
+
+ 流程图如下：
+
+![image-20210706143132923](imgs\383.png)
+
+#### 结合第三方登录理解OAuth2.0授权码方式
+
+##### 1.OAuth2.0的四种方式
+
+OAuth2.0规定了四种获得令牌的流程，你可以选择最适合自己的那一种，向第三方应用颁发**令牌**。下面就是这四种授权方式。
+
+- 授权码(authorization-code);
+- 隐藏式(implicit);
+- 密码式(password);
+- 客户端凭证(client credenials)。
+
+**注意**：不管哪一种授权方式，第三方 应用申请令牌之前，都必须先到系统备案，说明自己的身份，然后会拿到两个身份识别码：客户端ID(client ID)和客户端密钥(client secret). 这是为了防止令牌被滥用，**没有备案过的第三方应用，是不会拿到令牌的。**
+
+##### 2.OAuth2.0第三方登录流程
+
+###### (1) 第三方登录流程
+
+先来描述下用户肉眼看到的豆瓣第三方登录的流程。
+
+- 用户通过游览器进入豆瓣官方，选择微博登录，进入一个微博登录页面；
+- 用户输入自己的微博账户和密码，点击授权并登录；
+- 进入绑定手机号的页面(这一步跳过，假装没有)；
+- 登录成功，页面右上角显示用户的微博昵称。
+
+###### (2) 规范中的通用流程
+
+OAuth2.0框架协议规范中抽象出来的授权流程图。
+
+里面涉及到4个角色：
+
+- Client(豆瓣);
+- Resource Owner（用户本人，用户掌握着自己的微博账户和密码）；
+- Authoriztion Server(微博授权服务，鉴权，颁发code，token；
+- Resource Server(微博资源服务，保管用户的微博信息(比如：昵称))
+
+
+
+整个流程的文字描述如下：
+
+- A1-B1-C1
+
+游览器作为代理是整个流程的发起者和桥梁，用户首先会通过在游览器在豆瓣官方，选择第三方登录方式。
+
+- A2
+
+当用户选择了微博登录时，页面跳转到微博提供的第三方登录界面。
+
+```
+https://api.weibo.com/oauth2/authorize?redirect_uri=https%3A//accounts.douban.com/connect/sina_weibo/callback&
+response_type=code&
+client_id=1994016063
+```
+
+上面的url参数是简化过的，提取出比较重要的3个参数，这些参数的含义如下：
+
+client_id: 表示client的身份是豆瓣；
+
+response_type: 表示授权码模式；
+
+redirect_url:这个参数的作用是为了做一些验证。
+
+- B2
+
+用户输入微博账户和密码，点击“授权并登录”。
+
+- C2
+
+**微博授权服务器**认证用户身份成功后，返回一个**授权码code**给豆瓣。
+
+- D
+
+豆瓣拿到授权码，再加上redirect_url等参数，再次发送请求到**微博授权服务器；**
+
+- E
+
+微博授权服务器返回access_token给豆瓣，最终豆瓣就可以通过access_token去获取受限访问的微博用户信息。
+
+
+
+
+
+#### 单点登陆是什么？说下单点登陆的三种实现方式
+
+在 B/S 系统中，登录功能通常都是基于 Cookie 来实现的。当用户登录成功后，一般会将登录状态记录到 Session 中，或者是给用户签发一个 Token，无论哪一种方式，都需要在客户端保存一些信息（Session ID 或 Token ），并要求客户端在之后的每次请求中携带它们。在这样的场景下，使用 Cookie 无疑是最方便的，因此我们一般都会将 Session 的 ID 或 Token 保存到 Cookie 中，当服务端收到请求后，通过验证 Cookie 中的信息来判断用户是否登录 。
+
+单点登录（Single Sign On, SSO）是指在**同一帐号平台下的多个应用系统中，用户只需登录一次，即可访问所有相互信任的应用系统**。举例来说，**百度贴吧和百度地图是百度公司旗下的两个不同的应用系统，**如果用户在百度贴吧登录过之后，当他访问百度地图时无需再次登录，**那么就说明百度贴吧和百度地图之间实现了单点登录。**
+
+单点登录的本质就是在多个应用系统中共享登录状态。如果用户的登录状态是记录在 Session 中的，要实现共享登录状态，就要先共享 Session，比如可以将 Session 序列化到 Redis 中，让多个应用系统共享同一个 Redis，直接读取 Redis 来获取 Session。当然仅此是不够的，因为不同的应用系统有着不同的域名，尽管 Session 共享了，但是**由于 Session ID 是往往保存在浏览器 Cookie 中的，因此存在作用域的限制，无法跨域名传递**，也就是说当用户在 [http://app1.com](https://link.zhihu.com/?target=http%3A//app1.com) 中登录后，Session ID 仅在浏览器访问 [http://app1.com](https://link.zhihu.com/?target=http%3A//app1.com) 时才会自动在请求头中携带，而当浏览器访问 [http://app2.com](https://link.zhihu.com/?target=http%3A//app2.com) 时，Session ID 是不会被带过去的。**实现单点登录的关键在于，如何让 Session ID（或 Token）在多个域中共享**。
+
+##### 实现方式一、父域cookie
+
+在将具体实现之前，我们先来聊一聊 **Cookie 的作用域**。
+
+Cookie 的作用域由 **domain 属性和 path 属性共同决定**。domain 属性的有效值为**当前域或其父域的域名/IP地址**，在 Tomcat 中，domain 属性默认为**当前域的域名/IP地址**。path 属性的有效值是**以“/”开头的路径**，在 Tomcat 中，path 属性默认为当前 Web 应用的上下文路径。
+
+如果将 Cookie 的 domain 属性设置为当前域的父域，那么就认为它是父域 Cookie。Cookie 有一个特点，即**父域中的 Cookie 被子域所共享，换言之，子域会自动继承父域中的Cookie。**
+
+利用 Cookie 的这个特点，不难想到，将 Session ID（或 Token）保存到父域中不就行了。没错，我们只**需要将 Cookie 的 domain 属性设置为父域的域名（主域名），同时将 Cookie 的 path 属性设置为根路径**，这样所有的子域应用就都可以访问到这个 Cookie 了。不过这要求应用系统的域名需建立在一个共同的主域名之下，如 [http://tieba.baidu.com](https://link.zhihu.com/?target=http%3A//tieba.baidu.com) 和 [http://map.baidu.com](https://link.zhihu.com/?target=http%3A//map.baidu.com)，它们都建立在 [http://baidu.com](https://link.zhihu.com/?target=http%3A//baidu.com) 这个主域名之下，那么它们就可以通过这种方式来实现单点登录。
+
+总结：此种实现方式比较简单，**但不支持跨主域名。**
+
+##### 实现方式二、、认证中心
+
+我们可以部署一个认证中心，认证中心就是一个专门负责处理登录请求的独立的 Web 服务。
+
+用**户统一在认证中心进行登录，登录成功后，认证中心记录用户的登录状态，并将 Token 写入 Cookie**。（注意这个 Cookie 是认证中心的，应用系统是访问不到的。）
+
+应用系统检查当前请求有没有 Token，**如果没有，说明用户在当前系统中尚未登录，那么就将页面跳转至认证中心。由于这个操作会将认证中心的 Cookie 自动带过去，因此，认证中心能够根据 Cookie 知道用户是否已经登录过了**。如果认证中心发现用户尚未登录，则返回登录页面，等待用户登录，如果发现用户已经登录过了，就不会让用户再次登录了，而是会跳转回目标 URL ，并在跳转前生成一个 Token，拼接在目标 URL 的后面，回传给目标应用系统。
+
+应用系统拿到 Token 之后，还需要向认证中心确认下 Token 的合法性，防止用户伪造。确认无误后，应用系统记录用户的登录状态，并将 Token 写入 Cookie，然后给本次访问放行。（注意这个 Cookie 是当前应用系统的，其他应用系统是访问不到的。）当用户再次访问当前应用系统时，就会自动带上这个 Token，应用系统验证 Token 发现用户已登录，于是就不会有认证中心什么事了。
+
+##### 实现方式三、LocalStorage跨域
+
+前面，我们说实现单点登录的关键在于，如何让 **Session ID（或 Token）在多个域中共享。**
+
+父域 Cookie 确实是一种不错的解决方案，但是不支持跨域。那么有没有什么奇淫技巧能够让 Cookie 跨域传递呢？
+
+很遗憾，浏览器对 Cookie 的跨域限制越来越严格。Chrome 浏览器还给 Cookie 新增了一个 SameSite 属性，此举几乎禁止了一切跨域请求的 Cookie 传递（超链接除外），并且只有当使用 HTTPs 协议时，才有可能被允许在 AJAX 跨域请求中接受服务器传来的 Cookie。
+
+不过，在前后端分离的情况下，完全可以不使用 Cookie，我们可以选择将 Session ID （或 Token ）保存到浏览器的 LocalStorage 中，让前端在每次向后端发送请求时，主动将 LocalStorage 的数据传递给服务端。这些都是由前端来控制的，后端需要做的仅仅是在用户登录成功后，将 Session ID （或 Token ）放在响应体中传递给前端。
+
+在这样的场景下，单点登录完全可以在前端实现。前端拿到 Session ID （或 Token ）后，除了将它写入自己的 LocalStorage 中之外，还可以通过特殊手段将它写入多个其他域下的 LocalStorage 中。
+
+#### LRU淘汰策略
+
+##### 实现方式一、Java中的LRU实现方式
+
+在Java中LRU的实现方式是**使用HashMap结合双向链表**，HashMap的值是双向链表的节点，双向链表的节点也保存一份key value。
+
+- 新增key value的时候首先在链表结尾添加Node节点，如果超过LRU设置的阈值就淘汰队头的节点并删除掉HashMap中对应的节点。
+- 修改key对应的值的时候先修改对应的Node中的值，然后把Node节点移动队尾。
+- 访问key对应的值的时候把访问的Node节点移动到队尾即可。
+
+
+
+##### 实现方式二、InnoDB对LRU的优化
+
+缓冲池中的页大小默认为 16KB。但是 InnoDB 存储引擎对传统的 LRU 算法做了一些优化。 LRU 列表中加入了 midpoint 位置。新读取到的页，虽然是最新访问的页，**但并不是直接放入到 LRU 列表的首部，而是插入到 LRU 列表的 midpoint 位置**。在默认配置下，**该位置在 LRU 列表长度的 5/8 处。**在 InnoDB 存储引擎中，把 **midpoint之后的列表称为 old列表**，**之前的列表称为 new 列表**。可以简单地理解为 new 列表中的页都是最活跃的热点数据。
+
+**为什么要这样优化？如果直接讲读取的页放入到 LRU 列表的首部会有什么问题？**
+
+如果将直接读取的页放入到 LRU 的首部，**那么某些 SQL 操作可能会使缓冲池中的页被刷新出来，从而影响缓冲池的效率**。常见的这类操作作为**索引或数据的扫描操作。这类操作需要访问表中的许多页，甚至全部的页，而这些页通常来说又仅在这次查询操作中需要，并不是活跃的热点数据**。如果页被放入 LRU 列表的首部，那么非常可能将所需要的热点数据页从 LRU 列表中移除，而在下一次需要读取改页时，InnoDB 存储引擎需要再次访问磁盘。
+
+##### 实现方式三、Redis中LRU的实现
+
+- Redis维护了一个24位时钟，可以简单理解为当前系统的时间戳，每隔一定时间会更新这个时钟。每个key对象内部同样维护了一个24位的时钟，当新增key对象的时候会把系统的时钟赋值到这个内部对象时钟。比如我现在要进行LRU，那么首先拿到当前的全局时钟，然后再找到内部时钟与全局时钟距离时间最久的（差最大）进行淘汰，这里值得注意的是全局时钟只有24位，按秒为单位来表示才能存储194天，所以可能会出现key的时钟大于全局时钟的情况，如果这种情况出现那么就两个相加而不是相减来求最久的key。
+
+Redis中的LRU与常规的LRU实现并不相同，常规LRU会准确的淘汰掉队头的元素，**但是Redis的LRU并不维护队列，只是根据配置的策略要么从所有的key中随机选择N个（N可以配置）要么从所有的设置了过期时间的key中选出N个键，然后再从这N个键中选出最久没有使用的一个key进行淘汰。**
+
+#### 写时拷贝技术(copy on write)
+
+> COW（copy-on-write 的简称），是一种计算机设计领域的优化策略，其核心思想是：如果有多个调用者（callers）同时要求相同资源（如内存或磁盘上的数据存储），他们会共同获取相同的指针指向相同的资源，直到某个调用者试图修改资源的内容时，系统才会真正复制一份专用副本（private copy）给该调用者，而其他调用者所见到的最初的资源仍然保持不变。这过程对其他的调用者都是透明的（transparently）。此作法主要的优点是如果调用者没有修改该资源，就不会有副本（private copy）被创建，因此多个调用者只是读取操作时可以共享同一份资源（摘自 **维基百科**）。
+
+##### Linux的copy-on-write
+
+要理解 Linux 的 COW，必须要清楚两个函数 `fork()`、`exec()`，其中 `exec()` 是一组函数的统称，包括 `execl()`、`execlp()`、`execv()`、`execle()`、`execve()`、`execvp()`。
+
+**fork()函数介绍**
+
+`fork()` 是什么？它是 UNIX 操作系统中派生新进程的唯一方法，用于创建子进程，该**子进程等同于其父进程的副本**，他们**具有相同的物理空间（内存区），子进程的代码段、数据段、堆栈都是指向父进程的物理空间**，注意是在执行 `exec()` 之前。
+
+
+
+`fork()` 函数有一个特点就是，它是 **调用一次，返回两次**，调用是在父进程中调用创建子进程，返回有两个值，一个是返回给父进程，返回值为新子进程的进程 ID 号，一个返回给子进程，返回值为 0，所以我们基本上就可以根据返回值判断当前进程是子进程还是父进程。
+
+
+
+因为任何子进程只有一个父进程，我们可以通过调用 `getppid` 获取父进程的进程 ID，而父进程可以拥有多个子进程，所以 `fork()` 之后返回的就是子进程的进程 ID，这样它才能识别它的子进程。
+
+
+
+**exec()函数**
+
+`fork()` 创建的子进程其实就是父进程的副本，如果仅仅只是 fork 一个父进程副本其实没有多大意义，我们肯定希望的子进程能够干一些活，一些与父进程不一样的活，这个时候函数 `exec()` 就派上用场了。它的作用是 **装载一个新的程序，覆盖当前进程内存空间中的映像，从而执行不同的任务**。
+
+`fork` 会产生和父进程完全相同的子进程，如果采用传统的做法，会直接将父进程的数据复制到子进程中去，子进程创建完成后，父进程和子进程之间的数据段和堆栈就完成独立了，按照我们的惯例，子进程一般都会执行与父进程不一样的功能，`exec()` 后会将原有的数据清空，这样前面的复制过程就会变得无效了，这是一个非常浪费的过程，既然很多时间这种传统的复制方式是无效的，于是就有了 copy-on-write 技术的，原理也是非常简单的：
+
+
+
+`fork` 的子进程与父进程共享内存空间，如果子进程不对内存空间进行修改的花，内存空间的数据并不会真实复制给子进程，这样的结果会让子进程创建的速度变得很快（不用复制，直接引用父进程的物理空间）。
+
+`fork` 之后，子进程执行 `exec()` 也不会造成空间的浪费。
+
+
+
+##### Redis的copy-on-write
+
+我们知道 Redis 是单线程的，然后 Redis 的数据不可能一直存在内存中，肯定需要定时刷入硬盘中去的，这个过程则是 Redis 的持久化过程，那么作为**单线程的 Redis 是怎么实现一边响应客户端命令一边持久化的呢？答案就是依赖 COW**，具体来说就是依赖系统的 `fork` 函数的 COW 实现的。
+
+Redis 持久化有两种：**RDB 快照 和 AOF 日志。**
+
+
+
+RDB 快照表示的是某一时刻 Redis 内存中所有数据的写照。在执行 RDB 持久化时，Redis 进程会 fork 一个子进程来执行持久化过程，该过程是阻塞的，当 fork 过程完成后父进程会继续接收客户端的命令。子进程与 Redis 进程共享内存中的数据，但是子进程并不会修改内存中的数据，而是不断的遍历读取写入文件中，但是 **Redis 父进程则不一样，它需要响应客户端的命令对内存中数据不断地修改，这个时候就会使用操作系统的 COW 机制来进行数据段页面的分离，当 Redis 父进程对其中某一个页面的数据进行修改时，则会将页面的数据复制一份出来，然后对这个复制页进行修改**，这个时候子进程相应的数据页并没有发生改变，依然是 fork 那一瞬间的数据。
+
+
+
+AOF 日志则是将每个收到的写命令都写入到日志文件中来保证数据的不丢失。但是这样会产生一个问题，就是随着时间的推移，日志文件会越来越大，所以 **Redis 提供了一个重写过程（bgrewriteaof）来对日志文件进行压缩**。该重写过程也会调用 `fork()` 函数产生一个子进程来进行文件压缩。
+
+
+
+##### Java的copy onwrite
+
+熟悉 Java 并发的同学一定知道 Java 中也有两个容器使用了 copy-on-write 机制，他们分别是 CopyOnWriteArrayList 和 CopyOnWriteArraySet，他在我们并发使用场景中用处还是挺多的。现在我们就 CopyOnWriteArrayList 来简单分析下 Java 中的 copy-on-write。
+
+CopyOnWriteArrayList 实现 List 接口，底层的实现是采用数组来实现的。内部持有一个私有数组 array 用于存放各个元素。
+
+```
+private transient volatile Object[] array;
+```
+
+该数组不允许直接访问，只允许 `getArray()` 和 `setArray()` 访问。
+
+```
+    final Object[] getArray() {        return array;    }    final void setArray(Object[] a) {        array = a;    }
+```
+
+既然是 copy-on-write 机制，那么对于读肯定是直接访问该成员变量 array，如果是其他修改操作，则肯定是先复制一份新的数组出来，然后操作该新的数组，最后将指针指向新的数组即可，以 add 操作为例，如下：
+
+```
+    public boolean add(E e) {        final ReentrantLock lock = this.lock;        lock.lock();        try {            // 获取老数组            Object[] elements = getArray();            int len = elements.length;                        // 复制出新数组            Object[] newElements = Arrays.copyOf(elements, len + 1);                        // 添加元素到新数组中            newElements[len] = e;                        //把原数组引用指向新数组            setArray(newElements);            return true;        } finally {            lock.unlock();        }    }
+```
+
+添加的时候使用了锁，如果不使用锁的话，可能会出现多线程写的时候出现多个副本。
+
+读操作如下：
+
+```
+    public E get(int index) {        return get(getArray(), index);    }        private E get(Object[] a, int index) {        return (E) a[index];    }
+```
+
+读操作没有加锁，则可能会出现脏数据。
+
+所以 Java 中的 COW 容器的原理如下：
+
+> 当我们在修改一个容器中的元素时，并不是直接操作该容器，而是将当前容器进行 copy，复制出一个新的容器，然后在再对该新容器进行操作，操作完成后，将原容器的引用指向新容易，读操作直接读取老容器即可。
+>
+> 它体现的也是一种懒惰原则，也有点儿读写分离的意思（读和写操作的是不用的容器）
+>
+> 这两个容器适合读多写少的场景，毕竟每次写的时候都要获取锁和对数组进行复制处理，性能是大问题。
+
+
+
+## 场景题
+
+### 0.发送推广邮件
+
+淘宝经常会给用户发一些推广邮件；但是淘宝现在有几亿用户，不可能给每个会员都发送，我们一般会抽取部分用户来发送。假设淘宝现在有一亿会员（已经按照1、2、3……100000000的顺序排好），我们准备给这一亿会员中的100万会员发送推广邮件。**要求抽取这一百万会员要考虑到公平性（在抽取之前1亿会员中的每个人都有机会被抽到），相对分散，相对随机，不能重复，抽取速度要快。**我们提供了**一个随机函数random，能产生0-9的整数随机数。**请写出你能想到多种抽取方法，并写明抽取步骤。
+
+
+
+
+
+用bitmap方法实现，bitmap就是用一个bit标记某个元素对应的值，那么只用1亿个bit就能标记这一亿个会员，每一位初始化为0；**因为抽取100万个会员，考虑到公平性，我们可以将一亿会员平均分成100万份，每一份100个会员；** 
+
+  现在开始抽取，**运用random随机函数两次生成两个值，rand()%10 = A， rand()%10 = B;**  那么AB组成一个两位数（00~99之间）对应到每一份中的100个会员的一个，每一份抽取一个，这样100万份就抽取了100万个会员。
+
+
+
+**将一亿用户哈希到100个桶里，编号0-9，产生一个0-9的随机整数，选择整数对应的桶里的用户作为抽样结果**
+
+
+
+
+
+### 1.设计判断论文抄袭系统
+
+一类是**基于字符串比较的方法**；另一类是**基于词频统计的方法**；
+
+基于字符串的比较，通过某些选取策略在文档中选取一些策略作为指纹，指纹映射到hash表中，最后统计hash表中相同的指针数目，作为文本相似度依据。
+
+基于词频统计的方法：统计文档中各个单词的出现次数，然后根据单词频度构成文档的特征向量，最后采用点击、余弦或者类似方法度量两篇文章的特征向量。
+
+### 2.设计即时聊天的系统
+
+- 用户通过客户端进入系统，**向服务器发出消息，请求登录**；
+- 服务器收到请求后，向客户端返回应答消息，表示同意该用户加入，并告**诉自己服务线程所在的 监听端口号**；
+- **客户端通过服务器端口的建立 稳定的连接**；
+- 服务器端通过该连接**将当前在线用户的列表消息**传给新加入的客户端；
+- 客户端获得在线用户列表，就可以 独立自主与在线用户通信；
+- 当用户退出系统要及时地通知服务器；
+
+### 3.设计高并发的系统
+
+- HTML页面静态化访问频率较高但内容变动较小，使用**网站HTML静态化方案**来优化访问速度； 
+- **CDN加速：** 广泛采用各种缓存服务器，利用全局负载技术将用户的访问指向距离最近的工作正常的缓存服务器上，由【缓存服务器】直接响应用户请求。
+- **图片服务器**和**应用服务器分离**，分担web服务器的io负载，能够专门对图片服务器进行优化；
+- **数据库部分**，redis缓存数据；
+- **负载均衡**，为一个应用构建一个由多台服务器组成的服务器集群，将并发访问请求分发到多台服务器处理，避免单一服务器因负载压力过大而响应缓慢。
+- **消息队列**一个一个的排队方式，如12306一样。
+
+
+
+如：订票系统，某车次只有一张车票，假定有1w个人同时打开12306来订票，如何解决**并发问题**？
+
+使用**乐观锁，乐观锁**就是在不锁定表的情况下，利用锁的控制来解决并发问题。这样保证了数据的并发可读性、又保证了保存数据的排它性，保证性能的同时解决了并发带来的脏数据问题。
+
+
+
+**分布式和集群的区别是什么？**
+
+- 分布式：一个业务拆分成多个子业务，部署在不同的服务器上
+- 集群：同一个业务，部署在多个服务器上；
+
+### 4.实现展现热门文章，比如近8小时点击量最大的文章前100名
+
+点击-存储-计算topn->8小时是滑动窗口 槽口->定时任务来维护每个子节点，主节点汇总；去重处理
+
+- **数据接收**
+
+  - 客户端为了减轻服务器的压力而选择**延迟合并点击请求**并进行批量发送；
+  - 服务器有多台机器多进程部署来接受点击请求，接收到的请求在进行参数，解析后，被发送到**存储单元**；为了减轻存储的压力，每个进程可能会使用**小窗口聚合数据**，每隔一小段时间将窗口内的数据聚合起来发给存储单元。
+
+- **数据存储**
+
+  - 使用**kafka来存储日志记录**，zerocopy机制并发量很高，数据持久化在硬盘成本低，不过kafka的数据一般是有过期时间的，如果想完全记住用户的点击做长期的数据分析，需要**用分布式文件系统hdfs**。
+
+- **分布式topN算法**
+
+  - 用户太多了，用户表按用户ID哈希分成了1024张字表。用户表里面有一个score字段，表示这个用户的积分数，现在要统计计算前100名积分最多的用户以及积分数，该怎么查询？
+    - 如果是单张表，一个sql就搞定了；
+    - 如果是多张字表，需要在每个字表中都进行一次topn查询，然后聚合操作再**做一次topn查询**。当然**字表的查询可以多线程并行，提高聚合效率。**
+
+- **滑动窗口**
+
+  - 8小时的滑动窗口，意味着新的数据源源不断的进来，旧的数据时时刻刻淘汰，当然在业务中可以差几分钟；
+  - 对时间片进行切分，一分钟一个槽来进行技术，过期了8小时，移掉第一个，计算topn的帖子，维护窗口，移除过期的槽，然后统计topn，30-60s调用一次；
+
+- **定时任务**
+
+  - 每个子节点都会有一个定时任务去负责位置统计窗口，过期失效的数据，计算局部的topn热帖；
+  - 现在每个子节点都有了各自的局部topn热帖，那么还需要一个主节点去汇总这些局部热点，然后计算全局热帖。
+
+- **点击去重**
+
+  - 从客户端下手，**客户端本身可以过滤掉一部分无效点击，同一篇文章在太短时间内被当前用户反复点击**，这个模式还是很好发现的。如果间隔时间比较长，那就是读者的回味点击，属于文章的正向反馈，应该记录下来；
+  - 服务器还需要**防止用户的防刷行为**。如果缺失防刷控制，可以通过这种漏洞来使得自己的文章非法获得大量点击，进入热门文章列表，打上热门标签，被海量的用户看到，就会获得较大的经济效益
+
+  
+
+### 5.如何解决电商网站超卖现象？
+
+> 消息队列来处理 ；redis预减库存；
+>
+> 添加唯一索引，防止同一用户多次抢购；
+>
+> 乐观锁 版本号机制；悲观锁 其它线程无法提交数据；
+
+超卖是什么？
+
+因为数据库底层的写操作和读操作可以同时进行，虽然写操作默认带有隐式锁（即对同一数据不能同时进行写操作），但是读操作默认是不加锁的，所以所以当用户1去修改库存的时候，用户2依然可以读到库存为1，导致两个用户同时减一次库存，所以出现了超卖现象。
+
+解决方案有哪些？
+
+- **消息队列来异步处理消息；**
+- **redis预减库存：**系统初始化的时候，将商品库存加载到Redis 缓存中保存；收到请求的时候,先在Redis中拿到该商品的库存值，进行库存预减，如果减完之后库存不足，直接返回逻辑Exception； 就不需要访问数据库再去减库存了，如果库存值正确，进行下一步。将请求入队，立即给前端返回一个值，表示正在排队中，然后进行秒杀逻辑，后端队列进行秒杀逻辑，前端轮询后端发来的请求，如果秒杀成功，返回秒杀，成功，不成功就返回失败。
+- **添加唯一索引：**防止同一用户同一商品下两次订单unique key u_uid_gid(user_id,goods_id) using btree
+- **乐观锁：**版本号机制
+- **悲观锁，**这样其它线程无法提交数据
+
+### 6.如何保证消息队列是高可用的？
+
+多master模式，多master多slave异步复制模式、多maste人多slave同步双写模式。
+
+**如何保证消息不被重复消费？**
+
+一方面符合**幂等性**即可，拿到这个消息做redis的set操作，无论set几次结果都是一样的，set操作是符合幂等性；
+
+另一方面对消息做**唯一标识id**处理。
+
+## 海量数据处理场景题
+
+### 1.海量日志文件，提取出某日访问百度次数最多的IP。(映射->hashmap频率统计->1000个数找最大)
+
+首先是**这一天**，并且是访问**百度**的日志中的IP取出来，逐个写入到**一个大文件**中。
+
+IP是32位的，最多有2^32个IP。
+
+我们采用**映射**的方法，对IP进行映射，模取1000，将一个大文件映射成1000个小文件。
+
+在每个小文件中找出频率最大的IP(可以采用hashmap进行频率统计，找出频率最大的几个)
+
+之后再这1000个局部最大的IP中，找出频率最大的那个IP,即为所求。
+
+### 2.搜索引擎会通过日志文件将用户每次检索使用过的检索串都记录下来，统计最热门的的10个查询串(映射->hashmap统计频率->topk堆排序->合并)
+
+假设目前有一千万条记录（这些查询串的重复读比较高，虽然总数是1千万个，但如果去重后，不超过3百万个。一个查询串的重复读越高，说明查询它的用户越多，也就是越热门。）请统计出最热门的10个查询串，要求使用的内存不能超过1G。
+
+典型的TOP K算法。
+
+第一步：先对其海量数据预处理，用hash表进行排序；
+
+第二步：借助堆结构，找出topk。遍历
+
+### 3.有一个1G大小的一个文件，里面每一行是一个词，词的大小不超过16字节，内存限制大小是1M。返回频数最高的100个词？(映射->hashmap频率表->归并排序)
+
+顺序读取文件，对于每个词，取hash(x)%5000,将这些词存取到5000个小文件中；
+
+对每个小文件用hashmap来统计每个文件中出现的词语以及相应的频率；
+
+最后将其进行归并排序即可了。
+
+### 4.有10个文件，每个文件1G，每个文件的每一行存放的都是用户的query，每个文件的query都可能重复。要求你按照query的频度排序。(映射->hashmap频率->归并排序)
+
+还是topK算法。
+
+顺序读取10个文件，按照hash(query)%10的结果将query写入到另外的10个文件中。这样新生成的文件的每个大小大约为1G。
+
+找一台内存在2G左右的机器，依次对用hash_map(query,query_count)来统计每个query出现的次数，之后用快排或者堆排序进行排序。即得到了10个排好序的文件。最后对这10个文件归并排序即可。 
+
+### 5.给定a b 两个文件，各存放了50亿个url，每个url占64字节，内存限制是4G。请你找出a、b文件共同的url。(bitmap/映射 + hashset)
+
+遍历文件a，对每个url求取hash(url)%1000,然后将url分别存储在1000个小文件中；
+
+遍历文件b，对每个url求取hash(url)%1000,然后将url分别存储在1000个小文件中。
+
+而如果url相同，肯定是在同一个桶中，所有只需要求出1000个桶对应相同的url即可。
+
+遍历是否相同的url，可以把其中的一个小文件的url存储到hashset中，然后遍历另外一个小文件的url，看是否在，如果是，则就有共同的url了。
+
+
+
+如果我们允许有一定的错误率的话，可以使用布隆过滤器。4G内存大概可以表示340万亿bit。
+
+将其中一个文件中的url使用布隆过滤器映射到这340万亿个bit中，然后挨个读取另外一个文件的url，检查是否存在，如果是，则为url。（存在一定错误率）。
+
+### 6.在2.5亿个整数中找出不重复的整数(2-bitmap(00 01 10 11) /映射 hashset 排序)
+
+一方面：先将这2.5亿个整数，进行hash映射，划分成小文件。之后在小文件中通过hahset来查找不重复的数字，并排序。最后再归并排序。
+
+而另一方面：采用2-bitmap。（2-bitmap为每个数分配了2bit，00表示不存在，01表示出现一次，10 表示出现多次，11无意义）。扫描这2.5亿个整数，查看bitmap相应的位，如果是00变01,01变为10,10保持不变。最后查看bitmap，把对应位是01的整数输出即可。
+
+### 7.给40亿个不重复的unsigned int的整数，没排过序，然后再给一个数，如何快速判断这个数是否在那40亿个数当中。(bitmap)
+
+给一个bitmap，读入40亿个数，设置相应的bit位，然后读入要查询的数，查看相应的bit位是否为1，为1表示存在，为0表示不存在。
+
+### 8.怎么在海量数据中找出重复次数最多的一个？(映射->之后每个文件求最多)
+
+先做hash，然后求模映射为小文件，求出每个小文件中重复次数最多的一个，并记录重复次数。
+
+然后找出上一步求出的数据中重复次数最多的一个就是所求。小文件中通过hahset来查找不重复的数字。
+
+### 9.上千万或上亿数据(有重复)，统计其中出现次数最多的钱N个数据?(映射-hashmap-topk)
+
+上千万或上亿的数据，现在的机器内存应该能存下。
+
+考虑采用hash_map来进行统计次数。然后取出前N个出现次数最多的数据，用topk算法。
+
+### 10.一个文本文件，大约有一万行，每行一个词，要求统计出其中最频繁的前10个词，请给出思想，给出时间复杂度分析。(trie树频率->堆排序)
+
+用trie树来统计每个词出现的次数，时间复杂度是O(n*le).
+
+之后用堆来找出出现最频繁的前10个词，可以用堆来实现的。
+
+> 附加题：100w个数中找出最大的100个数。
+>
+> 用一个含100个元素的最小堆来完成的。复杂度为O(100w*log100).
+
+
+
+## 计算机操作系统
+
+Linux的操作系统整体上的划分**：进程调度，内存管理，文件系统，设备管理，网络模块。**
+
+
+
+- 概述
+- **进程管理**
+- **死锁**
+- **内存管理**
+- **设备管理**
+
+
+
+#### 0.什么是操作系统？
+
+> **操作系统**是管理**计算机硬件**和**软件资源**的计算机程序，提供一个**计算机用户与计算机硬件系统之间的接口**；
+>
+> 向上对用户提供接口，向下接管硬件资源；
+>
+> 操作系统本质上也是一个软件，作为最接近硬件的系统软件，负责**存储管理、设备管理、文件管理和进程管理。**
+
+
+
+从以下四个点来介绍什么是操作系统。
+
+- **<u>操作系统(Operating System,简称OS)是管理计算机硬件与软件资源的程序，是计算机的基石；</u>**
+- **操作系统本质上是一个运行在计算机上的软件程序，用于管理计算机硬件和软件资源；**
+- **操作系统存在屏蔽了硬件层的复杂性；**
+- **操作的内核(Kernel)是操作系统的核心，它负责系统的内存管理，硬件设备的管理，文件系统的管理以及应用程序的管理。**
+
+
+
+**附加题：什么是内核态和用户态？**
+
+**为了避免操作系统和关键数据被用户程序破坏**，将处理器的执行状态分为**内核态**和**用户态**；
+
+**内核态**是操作系统管理程序执行所处的状态，能够执行包含特权指令在内的一切指令，**能够访问系统内所有的存储空间。**
+
+**用户态**是用户程序执行时处理器所处的状态，不能执行特权指令，**只能访问用户地址空间**。用户程序运行在用户态，操作系统内核运行在内核态。
+
+
+
+**附加题：如何实现内核态和用户态的切换？**
+
+处理器从用户态切换到内核态的方法有三种：系统调用、异常和外部中断。
+
+- 系统调用是操作系统的最小功能单位，是操作系统提供的用户接口，系统调用本身是一种软中断；
+- 异常，也叫作内中断，是由错误引起的，如文件损坏，缺页故障；
+- 外部中断，是通过信号线来通知处理器外设的状态变化，是硬中断。
+
+
+
+**什么是进程？**
+
+进程是操作系统中资源分配的基本单位。
+
+进程的经典定义：一个执行中程序的实例，系统中的每个程序都运行在某个进程的上下文中。
+
+上下文：程序正确运行所需的状态所组成的，这个**状态包括存放在内存中的程序的代码和数据，它的栈、通用目的寄存器的内容、程序计数器、环境变量以及文件描述符的集合。**
+
+
+
+**什么是信号**
+
+一个信号就是一条小消息，它通知进程系统中发生了一个某种类型的事件。 Linux 系统上支持的30 种不同类型的信号。 每种信号类型都对应于某种系统事件。低层的硬件异常是由内核异常处理程序处理的，正常情况下，对用户进程而言是不可见的。信号提供了一种机制，通知用户进程发生了这些异常。
+
+- 发送信号：内核通过更新目的进程上下文中的某个状态，发送（递送）一个信号给目的进程。发送信号可以有如下两种原因：
+  - 内核检测到一个系统事件，比如除零错误或者子进程终止。
+  - —个进程调用了kill 函数， 显式地要求内核发送一个信号给目的进程。一个进程可以发送信号给它自己。
+
+- 接收信号：当目的进程被内核强迫以某种方式对信号的发送做出反应时，它就接收了信号。进程可以忽略这个信号，终止或者通过执行一个称为信号处理程序(signal handler)的用户层函数捕获这个信号。
+
+
+
+**补充题：进程调度的时机**
+
+- **当前运行的进程结束**；
+- **当前运行的进程由于某种原因阻塞**；
+- 在使用抢占调度的系统中，**具有更高优先级的进程就绪时**；
+- 分时系统中，**分给当前进程的时间片用完**；
+- 执行完**系统调用等系统程序后返回给用户进程**；
+
+
+
+**补充题：不能进行进程调度的情况**
+
+- 在**中断处理程序执行时**；
+- 在操作系统的**内核程序临界区**；
+- 其它需要**完全屏蔽中断的原子操作过程中**；
+
+
+
+**补充题：进程的调度策略**
+
+- **先来先服务调度**算法；
+- **短作业优先调度**算法；
+- **优先级调度**算法；
+- 时间片轮转调度算法；
+- 高响应比优先调度算法；
+- 多级队列调度算法；
+- 多级反馈队列调度算法；
+
+
+
+**补充题：进程的状态与状态转换**
+
+进程在运行时有三种基本状态：**就绪态**、**运行态**和**阻塞态、**
+
+- **就绪态**：进程具备运行条件，等待系统分配处理器以便运行的状态。 当**进程已分配到除CPU以外的所有必要资源后，只要再获得CPU，便可立即执行，进程这时的状态称为就绪状态。**在一个系统中处于就绪状态的进程可能有多个，通常将它们排成一个队列，称为就绪队列。
+- **运行（running）态**：进程占有处理器正在运行的状态。**进程已获得CPU，其程序正在执行**。在单处理机系统中，只有一个进程处于执行状态； 在多处理机系统中，则有多个进程处于执行状态。
+- **阻塞（wait）态**：又称等待态或睡眠态，指进**程不具备运行条件，正在等待某个时间完成的状态。**
+
+
+
+**各状态之间的转换：**
+
+- 就绪→执行 处于就绪状态的进程，当**进程调度程序为之分配了处理机**后，该进程便由就绪状态转变成执行状态。
+- 执行→就绪 处于执行状态的进程在其执行过程中，因**分配给它的一个时间片已用完而不得不让出处理机，**于是进程从执行状态转变成就绪状态。
+- 执行→阻塞 正在执行的进程因**等待某种事件发生而无法继续执行时，**便从执行状态变成阻塞状态。
+- 阻塞→就绪 处于阻塞状态的进程，若**其等待的事件已经发生，**于是进程由阻塞状态转变为就绪状态。
+
+
+
+**附加问题：什么是孤儿进程？僵尸进程？**
+
+**孤儿进程**： **父进程退出，子进程还在运行的这些子进程都是孤儿进程，**孤儿进程将被init进程（1号进程）所收养，并由init进程对他们完成状态收集工作。
+
+**僵尸进程**： **进程使用fork创建子进程，如果子进程退出，而父进程并没有调用wait 获waitpid 获取子进程的状态信息，那么子进程的进程描述符仍然保存在系统中的这些进程是僵尸进程。**
+
+
+
+**附加问题：什么是虚拟内存**
+
+**为了更加有效地管理内存并且少出错，现代系统提供了一种对主存的抽象概念，叫做虚拟内存(VM)**。虚拟内存是硬件异常、硬件地址翻译、主存、磁盘文件和内核软件的完美交互，**它为每个进程提供了一个大的、一致的和私有的地址空间。**通过一个很清晰的机制，虚拟内存提供了三个重要的能力：
+
+- 它将主存看成是一个存储在磁盘上的地址空间的高速缓存，在主存中只保存活动区域，并根据需要在磁盘和主存之间来回传送数据，通过这种方式，它高效地使用了主存。
+- 它为每个进程提供了一致的地址空间，从而简化了内存管理。
+- 它保护了每个进程的地址空间不被其他进程破坏。
+
+
+
+**常见的页面置换算法**
+
+- 先进先出(FIFO)算法：
+  - 思路：置换最先调入内存的页面，即置换在内存中驻留时间最久的页面。
+  - 实现：按照进入内存的先后次序排列成队列，从队尾进入，从队首删除。
+  - 特点：实现简单；性能较差，调出的页面可能是经常访问的
+
+- 最近最少使用（`LRU`）算法:
+  - 思路： 置换最近一段时间以来最长时间未访问过的页面。根据程序局部性原理，刚被访问的页面，可能马上又要被访问；而较长时间内没有被访问的页面，可能最近不会被访问。
+  - 实现：缺页时，计算内存中每个逻辑页面的上一次访问时间，选择上一次使用到当前时间最长的页面
+  - 特点：可能达到最优的效果，维护这样的访问链表开销比较大
+
+- 最不常用算法（`Least Frequently Used, LFU`）
+  - 思路：缺页时，置换访问次数最少的页面
+  - 实现：每个页面设置一个访问计数，访问页面时，访问计数加1，缺页时，置换计数最小的页面
+  - 特点：算法开销大，开始时频繁使用，但以后不使用的页面很难置换
+
+
+
+**什么是写时复制？**
+
+**如果有多个进程要读取它们自己的那部门资源的副本，那么复制是不必要的。每个进程只要保存一个指向这个资源的指针就可以了**。只要没有进程要去修改自己的“副本”，就存在着这样的幻觉：**每个进程好像独占那个资源。从而就避免了复制带来的负担。**
+
+**如果一个进程要修改自己的那份资源“副本”，那么就会复制那份资源，并把复制的那份提供给进程。不过其中的复制对进程来说是透明的。这个进程就可以修改复制后的资源了，同时其他的进程仍然共享那份没有修改过的资源。**所以这就是名称的由来：**在写入时进行复制。**
+
+
+
+#### 0.内存对齐是什么？为什么需要内存对齐
+
+**概念**
+
+内存对齐跟数据在内存中的位置有关，**如果一个变量的内存地址正好处于它长度的整数倍**，它就被称作自然对齐。比如在32位cpu下，假设一个整型变量的地址为0x00000004，那它就是自然对齐的。
+
+**为什么要内存对齐呢？**
+
+**字节对齐主要还是为了提高内存的访问效率，**比如intel 32位cpu，每个总线周期都是从偶地址开始读取32位的内存数据，如果数据存放地址不是从偶数开始，则可能出现需要两个总线周期才能读取到想要的数据，因此需要在内存中存放数据时进行对齐。
+
+
+
+
+
+#### 1.什么是系统调用呢？
+
+**在介绍系统调用之前，先来了解一下用户态和内核态；**
+
+<u>根据进程访问资源的特点，可以把进程在系统上的运行分为两个级别：</u>
+
+- <u>**用户态：用户态运行的进程可以直接读取用户程序的数据；**</u>
+- <u>**内核态：可以理解为在内核态运行的进程或程序几乎可以访问计算机的任何资源，不受限制。**</u>
+
+说了用户态和内核态之后，那么什么是系统调用呢？
+
+<u>我们运行的程序基本都是运行在用户态，如果我们调用操作系统提供的内核态的子功能咋办呢，这就需要**系统调用**了。</u>
+
+<u>**也就是说我们运行的用户程序中，凡是与系统态级别的资源有关的操作（如文件管理、进程控制、内存管理等），都必须通过系统调用方式向操作系统提出请求，并由操作系统代为完成。**</u>
+
+这些系统调用功能大致可分为如下几类：
+
+- **设备管理**。完成设备的请求或释放，以及设备启动等功能；
+- **文件管理**。完成文件的读、写、创建以及删除等功能；
+- **进程控制**。完成进程的创建、撤销、阻塞以及唤醒等功能；
+- **进程通信**。完成进程之间的消息传递或信号传递等功能；
+- **内存管理**。完成内存的分配、回收以及获取作业占用内存区大小以及地址等功能。
+
+#### 2.用户态转向内核态的过程是怎么样的呢？
+
+- int 0x80- 128
+
+- 保存用户现场；
+
+  - 寄存器压入栈；
+  - 进行syscall；
+  - 内核态返回eax；
+  - 恢复用户态现场；
+  - 用户程序继续执行；
+
+  
+
+
+
+#### 2.操作系统的内核
+
+- **操作系统的内核(Kernel)是操作系统的核心部分**，它负责系统的内存管理，硬件设备的管理，文件系统的管理以及应用程序的管理。
+- 操作系统的内核是连接应用程序和硬件的桥梁，决定着操作系统的性能和稳定性。
+
+#### 3.中央处理器(CPU,Central Processing Unit)
+
+- CPU是一台计算机的**运算核心(Core) + 控制核心(Control Unit)**，可以称得上是计算机的大脑；
+- CPU主要包括两个部分：**控制器+运算器**；
+- CPU的根本任务是**执行指令**，对计算机来说最终都是一串由“0”和“1”组成的序列。
+
+#### 4.如何理解CPU和内核Kernel的区别呢
+
+- 操作系统的内核(Kernel)属于操作系统层面，而CPU属于硬件；
+- CPU主要提供运算，处理各种指令的能力。内核(Kernel)直呼要负责系统管理比如内存管理，屏蔽了对硬件的操作。
+
+![image-20210419130414675](imgs\85.png)
+
+用户程序、系统调用、内核和硬件之间的关系是什么呢？
+
+![image-20210419130630838](imgs\86.png)
+
+
+
+
+
+
+
+**2.基本功能：**
+
+**进程管理:** 进程控制、进程同步、进程通信、死锁控制；
+
+**内存管理：**内存分配、地址映射、内存保护与共享、虚拟内存地址；
+
+**文件管理：**文件存储空间的管理、目录管理；
+
+**设备管理：**完成用户的I/O请求，方便用户使用各种设备，并提高设备的利用率。
+
+
+
+**3.基本特征：**
+
+- **并发：** 并发是指宏观上在**一段时间内能同时运行多个程序**；并行指的是**同一时刻能运行多个指令**；**并行需要硬件支持**，如多核处理线；**并发则是操作系统引入进程和线程**，使得程序能够并发运行。
+- 共享：共享是指系统中的资源可以被多个并发进程共同使用；有两种共享方式：互斥共享和同时共享；
+- 虚拟：把一个物理实体转换为多个逻辑实体；主要有两种虚拟技术：时分复用技术和空分复用技术；
+- 异步
+
+
+
+**4.中断分类**
+
+- **外中断**：由CPU执行指令以外的事件引起，如I/O中断、控制台中断；
+- **异常**：由CPU执行指令的内部事件引起；
+- **陷入**：在用户程序中使用系统调用；
+
+
+
+**5.计算机操作系统-链接**
+
+- 预处理阶段：处理以#开头的预处理命令；
+- 编译阶段：翻译成汇编文件；
+- 汇编阶段：将汇编伪码翻译成可重定位目标文件；
+- 链接阶段：将可重定位目标文件和printf.o等单独预编译好的目标文件进行合并，得到最终的执行文件。
+
+
+
+#### 5.中断  硬中断和软中断
+
+##### 5.0 时间片轮转算法
+
+ 时间片轮转（Round-Robin）调度算法是操作系统一种比较公平的进程调度的方式，这种方式使得**就绪队列上的所有进程在每次轮转时都可以运行相同的一个时间片。**
+
+**进程切换时机**
+
+进程在执行时分为两种情况：
+
+- 在**该时间片内进程执行完毕，这种情况调度程序将立即把该进程弹出队列，并把 CPU 分配给新的队首进程**；
+- 在该时间片内进程未执行完毕，调度程序将**立即中断该进程执行，把该进程加入队尾，并将 CPU 分配给新的队首进程**
+
+ **时间片大小**
+
+ 在 RR 算法中，时间片的大小直接影响了系统的性能。
+
+- 时间片过小，有利于短作业，但是会频繁地切换进程，增加了系统的开销，影响性能。
+- 时间片过大，算法退化成 FCFS 算法，如果某个短作业进程之前的进程都是长作业，将导致后面的短作业进程长时间等待。
+
+
+
+##### 5.1 中断的过程
+
+从本质上来讲，**中断是一种电信号，当设备有某种事件发生时**，就会产生中断。之后总线通过把**电信号发送给中断控制器**。
+
+如果中断的线是激活的，**中断控制器把电信号发送给处理器的某个特定引脚**，处理器于是立即停止自己正在做的事情。
+
+**跳转到中断处理程序的入口点，进行中断处理**。
+
+![image-20210714220201053](imgs\468.png)
+
+##### 5.2 硬中断
+
+1. 硬中断是由硬件产生的，比如，**像磁盘，网卡，键盘，时钟等。每个设备或设备集都有它自己的IRQ（中断请求**）。基于IRQ，CPU可以将相应的请求分发到对应的硬件驱动上（注：硬件驱动通常是内核中的一个子程序，而不是一个独立的进程）。
+2. **处理中断的驱动是需要运行在CPU上的**，因此，当中断产生的时候，**CPU会中断当前正在运行的任务，来处理中断**。在有多核心的系统上，一个中断通常只能中断一颗CPU（也有一种特殊的情况，就是在大型主机上是有硬件通道的，它可以在没有主CPU的支持下，可以同时处理多个中断。）。
+3. **硬中断可以直接中断CPU。它会引起内核中相关的代码被触发。**对于那些需要花费一些时间去处理的进程，中断代码本身也可以被其他的硬中断中断。
+4. 对于时钟中断，**内核调度代码会将当前正在运行的进程挂起，从而让其他的进程来运行。**它的存在是为了让调度代码（或称为调度器）可以调度多任务。
+
+##### 5.2 软中断
+
+1. 软中断的处理非常像硬中断。然而，它们仅仅是**由当前正在运行的进程所产生的。**
+2. 通常，**软中断是一些对I/O的请求**。这些请求会**调用内核中可以调度I/O发生的程序**。对于某些设备，I/O请求需要被立即处理，而磁盘I/O请求通常可以排队并且可以稍后处理。根据I/O模型的不同，进程或许会被挂起直到I/O完成，此时内核调度器就会选择另一个进程去运行。I/O可以在进程之间产生并且调度过程通常和磁盘I/O的方式是相同。
+3. 软中断仅与内核相联系。软中断仅与内核相联系。而内核主要负责对需要运行的任何其他的进程进行调度。一些内核允许设备驱动的一些部分存在于用户空间，并且当需要的时候内核也会调度这个进程去运行。一些内核允许设备驱动的一些部分存在于用户空间，并且当需要的时候内核也会调度这个进程去运行。
+4. **软中断并不会直接中断CPU。也只有当前正在运行的代码（或进程）才会产生软中断**。这种中断是一种需要内核为正在运行的进程去做一些事情（通常为I/O）的请求。有一个特殊的软中断是Yield调用，它的作用是请求内核调度器去查看是否有一些其他的进程可以运行。
+
+##### 5.3 硬中断与软中断的区别是什么呢？
+
+**硬中断是由外设引发的，软中断是执行中断指令产生的**。
+
+**硬中断的中断号是由中断控制器提供的，软中断的中断号由指令直接指出，无需使用中断控制器。**
+
+**硬中断是可屏蔽的，软中断不可屏蔽。**
+
+**硬中断处理程序要确保它能快速地完成任务，这样程序执行时才不会等待较长时间，称为上半部。**
+
+**软中断处理硬中断未完成的工作，是一种推后执行的机制，属于下半部。**
+
+
+
+### 计算机操作系统-死锁
+
+##### 1.死锁产生的必要条件是什么？
+
+**死锁是两个或两个以上的进程(或线程)在执行过程中，互相占用对方所需的资源，因争夺资源而造成的一种互相等待的现象，若无外力作用，它们都将无法推进下去；**
+
+**互斥：**每个资源要么已经分配给了一个进程，要么就是可用的；
+
+**占有和等待：**已经等到某个资源的进程可用再请求新的资源；
+
+**不可抢夺：**已经分配给一个进程的资源不能强制性的被抢夺，它只能被占有它的线程显式地释放；
+
+**环路等待：**有两个或者两个以上的进程组成一条环路，该环路中的每个进程都在等待下一个进程所占有的资源；
+
+##### 2.详解银行家算法
+
+**银行家算法是一种可以避免死锁的方法。**
+
+> 以银行借贷系统的分配策略为基础，判断并保证系统的安全运行。我们可以把操作系统看做是银行家，操作系统管理的资源相当与银行家管理的资金，进程向操作系统请求分配资源就相当于用户向银行家贷款。
+
+**实现方法：**
+
+为保证资金的安全，银行家规定:
+
+(1) 当一个顾客对资金的最大需求量不超过银行家现有的资金时就可接纳该顾客;
+**（即当资源池中剩余的可利用资源 >= 线程还需要的资源时，就可以将可利用资源分配给此线程）**
+(2) 顾客可以分期贷款,但贷款的总数不能超过最大需求量;
+**（线程可以请求分配资源，但是请求的资源总数不能超过资源池中剩余的可利用资源）**
+(3) 当银行家现有的资金不能满足顾客尚需的贷款数额时,对顾客的贷款可推迟支付,但总能使顾客在有限的时间里得到贷款;
+**（当线程池中的资源暂时不满足当前的线程所需时，将此线程先暂时搁置，先将资源分配给能够满足的需求的其他线程，等到线程池中的资源足够满足先前搁置的线程时，在将资源分配给搁置的线程）**
+(4) 当顾客得到所需的全部资金后,一定能在有限的时间里归还所有的资金。
+**（当线程拿到所需要的所有资源，运行结束后，将自身所有的资源放回资源池中）**
+
+
+
+
+
+##### 2.死锁的解决策略
+
+鸵鸟不做处理；
+
+死锁检测与恢复；
+
+死锁预防；
+
+死锁避免；
+
+
+
+主要有以下四种办法：
+
+- **鸵鸟策略**
+
+把头埋在沙子里面，假装根本没发生问题。当发生死锁时不会对用户造成很大的影响或发生死锁的概率很低时，可以采用鸵鸟策略；
+
+- **死锁检测与死锁恢复；**
+
+不试图阻止死锁，而是当**检测**到死锁时，采取措施进行**恢复**；
+
+死锁的检测是通过**检测有向图是否存在环来实现的**。从**一个结点出发进行深度优先搜索，对已访问过的结点进行标记，如果访问了已标记的结点，就表示有向图存在环，也就是检测到死锁的发生**。
+
+死锁的恢复：通过**杀死线程恢复**；通过回滚恢复；通过抢占恢复；
+
+- **死锁预防；**
+
+针对死锁的产生条件：
+
+**破坏互斥条件：**例如打印机唯一真正请求物理打印机的进程是打印机守护进程；
+
+**破坏占有和等待条件：**规定进程在开始执行前请求所需要的全部资源；
+
+**破坏不可抢夺条件**
+
+**破坏环路等待：**给资源统一编号，进程只能按照编号顺序来请求资源；
+
+
+
+**死锁避免：安全状态。**
+
+
+
+### 计算机操作系统-进程管理
+
+#### 0.进程调度  进程通信  进程同步
+
+##### 0.1 进程调度算法
+
+**1.等待态：等待某个事件的完成；**
+
+**2.就绪态：等待系统分配处理器以便运行；**
+
+**3.运行态：占有处理器正在运行。**
+
+
+
+**先来先服务算法；**
+
+　　先来先去服务调度算法是一种最简单的调度算法，也称为先进先出或严格排队方案。当每个进程就绪后，它加入就绪队列。当前正运行的进程停止执行，选择在就绪队列中存在时间最长的进程运行。该算法既可以用于作业调度，也可以用于进程调度。先来先去服务比较适合于常作业（进程），而不利于段作业（进程）。
+
+**时间片轮转算法；**
+
+　　轮转法是基于适中的抢占策略的，以一个周期性间隔产生时钟中断，当中断发生后，当前正在运行的进程被置于就绪队列中，然后基于先来先去服务策略选择下一个就绪作业的运行。这种技术也称为时间片，因为每个进程再被抢占之前都给定一片时间。
+
+**最短进程优先**；
+
+　　最短进程优先是一个非抢占策略，他的原则是下一次选择预计处理时间最短的进程，因此短进程将会越过长作业，跳至队列头。该算法即可用于作业调度，也可用于进程调度。但是他对长作业不利，不能保证紧迫性作业（进程）被及时处理，作业的长短只是被估算出来的。
+
+**最短剩余时间优先；**
+
+　　**最短剩余时间是针对最短进程优先增加了抢占机制的版本。在这种情况下，进程调度总是选择预期剩余时间最短的进程**。当一个进程加入到就绪队列时，他可能比当前运行的进程具有更短的剩余时间，因此只要新进程就绪，调度程序就能可能抢占当前正在运行的进程。像最短进程优先一样，调度程序正在执行选择函数是必须有关于处理时间的估计，并且存在长进程饥饿的危险。
+
+最高响应比优先；
+
+根据比率：R=(w+s)/s （R为响应比，w为等待处理的时间，s为预计的服务时间）
+
+　　如果该进程被立即调用，则R值等于归一化周转时间（周转时间和服务时间的比率）。R最小值为1.0，只有第一个进入系统的进程才能达到该值。调度规则为：当前进程完成或被阻塞时，选择R值最大的就绪进程，它说明了进程的年龄。当偏向短作业时，长进程由于得不到服务，等待时间不断增加，从而增加比值，最终在竞争中赢了短进程。
+
+　　和最短进程优先、最短剩余时间优先一样，使用最高响应比策略需要估计预计服务时间。
+
+**反馈队列算法；**
+
+**如果没有关于进程相对长度的任何信息，则最短进程优先，最短剩余时间、最高响应优先比都不能使用**。另一种导致偏向短作业的方法是**处罚运行时间较长的作业，换句话说，如果不能获得剩余的执行时间，那就关注已执行了的时间。**
+
+　　方法为：调度基于被抢占原则（按时间片）并使用**动态优先级机制。**当一个进程第一次进入系统中时，他被放置在一个优先级队列中，当第一次被抢占后并返回就绪状态时，它被放置在**下一个低优先级队列中，在随后的时间里，每当被抢占时，他被降级到下一个低优先级队列中。**一个短进程很快被执行完，不会在就绪队列中降很多级，**一个长进程会逐渐降级。因此先到的进程和短进程优先于长进程和老进程。**在每个队列中，除了优先级在最低的队列中之外，都是用简单的先来先去服务机制，一旦一个进程处于优先级最低的队列中，它就不可能在降级，但会重复的返回该队列，直到运行结束。因此，该队列课按照轮转方式调度。
+
+**多级反馈队列调度算法；**
+
+**多级反馈队列算法，不必事先知道各种进程所需要执行的时间，他是当前被公认的一种较好的进程调度算法。其实施过程如下：**
+
+　　1)**设置多个就绪队列，并为各个队列赋予不同的优先级。在优先权越高的队列中，为每个进程所规定的执行时间片就越小。**
+
+　　2)当一个新进程进入内存后，首先放入第一队列的末尾，按照**先来先去原则排队等候调度。如果他能在一个时间片中完成，便可撤离；**如果未完成，就转入第二队列的末尾，同样等待调度.....如此下去，当一个长作业（进程）从第一队列依次将到第n队列（最后队列）后，便按第n队列时间片轮转运行。
+
+　　3)仅当第一队列空闲的时候，调度程序才调度第二队列中的进程运行；仅当第1到（i-1）队列空时，才会调度第i队列中的进程运行，并执行相应的时间片轮转。
+
+　　4)如果处理机正在处理第i队列中某进程，又有新进程进入优先权较高的队列，则此新队列抢占正在运行的处理机，并把正在运行的进程放在第i队列的队尾。
+
+##### mmap
+
+mmap是一种内存映射文件的方法，即将**一个文件或者其它对象映射到进程的地址空间，实现文件磁盘地址和进程虚拟地址空间中一段虚拟地址的一一对映关系。实现这样的映射关系后，进程就可以采用指针的方式读写操作这一段内存，而系统会自动回写脏页面到对应的文件磁盘上，即完成了对文件的操作而不必再调用read,write等系统调用函数。**相反，内核空间对这段区域的修改也直接反映用户空间，从而可以实现不同进程间的文件共享。如下图所示：
+
+![image-20210729133222808](imgs\548.png)
+
+由上图可以看出，进程的虚拟地址空间，由多个虚拟内存区域构成。虚拟内存区域是进程的虚拟地址空间中的一个同质区间，即具有同样特性的连续地址范围。上图中所示的text数据段（代码段）、初始数据段、BSS数据段、堆、栈和内存映射，都是一个独立的虚拟内存区域。而为**内存映射服务的地址空间**处在**堆****栈**之间的空余部分。
+
+
+
+##### 0.2 进程间8种通信方式详解
+
+**进程通信**
+
+每个进程各自有不同的用户地址空间，任何一个进程的全局变量在另一个进程中都看不到，所以进程之间要交换数据必须通过内核，即**在内核中开辟一块缓冲区，进程A把数据从用户空间拷贝到内核缓冲区，进程B再从内核缓冲区把数据读走，内核提供的这种方式就被成为进程间通信。**
+
+###### a.匿名管道通信
+
+**匿名管道( pipe )：**管道是一种半双工的通信方式，数据只能**单向流动**，而且只能在具有亲缘关系的进程间使用。进程的亲缘关系通常是指**父子进程关系**。
+
+```
+// 需要的头文件
+#include <unistd.h>
+
+// 通过pipe()函数来创建匿名管道
+// 返回值：成功返回0，失败返回-1
+// fd参数返回两个文件描述符
+// fd[0]指向管道的读端，fd[1]指向管道的写端
+// fd[1]的输出是fd[0]的输入。
+int pipe (int fd[2]);
+```
+
+通过匿名管道实现进程间通信的步骤如下：
+
+- 父进程创建管道，得到两个⽂件描述符指向管道的两端；
+- 父进程fork出子进程，⼦进程也有两个⽂件描述符指向同⼀管道。
+- 父进程关闭fd[0],子进程关闭fd[1]，即⽗进程关闭管道读端,⼦进程关闭管道写端（因为管道只支持单向通信）。⽗进程可以往管道⾥写,⼦进程可以从管道⾥读,管道是⽤环形队列实现的,数据从写端流⼊从读端流出,这样就实现了进程间通信。
+
+###### b.高级管道通信
+
+高级管道(popen)：将**另一个程序当做一个新的进程在当前程序进程中启动，则它算是当前程序的子进程**，这种方式我们成为高级管道方式。
+
+###### c.有名管道通信
+
+有名管道 (named pipe) ： **有名管道也是半双工的通信方式**，但是**它允许无亲缘关系进程间的通信。**
+
+###### d.消息队列通信
+
+消息队列( message queue ) ： 消息队列是由消息的链表，存放在内核中并由消息队列标识符标识。**消息队列克服了信号传递信息少、管道只能承载无格式字节流以及缓冲区大小受限等缺点**。
+
+//创建和访问一个消息队列
+int msgget(key_t key,int msgflag);
+//消息队列的控制函数
+int msgctl(int msqid,int cmd,struct msqid_ds *buf);
+//把一条消息添加到消息队列中
+int msgsnd(int msqid,const void *msgp,size_t msgsz,int msgflg);
+//从一个消息队列中接收消息
+
+- 消息队列可以双向通信
+
+* 克服管道只能横在无格式字节流的缺点
+
+###### e.信号量
+
+信号量( semophore ) ： **信号量是一个计数器，可以用来控制多个进程对共享资源的访问。**它常作为一种锁机制，防止某进程正在访问共享资源时，其他进程也访问该资源。因此，主要作为进程间以及同一进程内不同线程之间的同步手段。
+
+###### f.信号
+
+信号 ( sinal ) ： 信号是一种比较复杂的通信方式，用于通知接收进程某个事件已经发生。
+
+###### g.共享存储
+
+共享内存( shared memory ) ：**共享内存就是映射一段能被其他进程所访问的内存，这段共享内存由一个进程创建，**但多个进程都可以访问。**共享内存是最快的 IPC 方式，它是针对其他进程间通信方式运行效率低而专门设计的。它往往与其他通信机制，如信号量，配合使用，来实现进程间的同步和通信。**
+
+
+
+共享内存原理每个进程都有自己的进程控制块PCB和地址空间Addr space，并且都有一个与之对应的页表，负责将进程之间的虚拟地址与物理地址进行映射，通过内存管理单元进行管理，**两个不同的进程的虚拟地址通过页表映射到物理区域的同一区域，它们所指向的内存称为共享内存**
+
+![image-20210729120321751](imgs\547.png)
+
+###### h.套接字通信
+
+socket bind listen connect read write close
+
+##### 0.3 进程 同步详解
+
+
+
+
+
+#### 0.Windows下CPU核数和线程数？CPU核数和线程的关系
+
+**CPU单核和多核的区别？**
+
+最早的CPU都是单核，单核cpu也就是单核处理器，后来演变出了多核CPU，多核心cpu把两个或更多独立处理器封装在一个单一集成电路，每个核心分别负责处理一项运算，而单核CPU在多个应用的相互切换中就显得略有不足，比不上多核了。cpu多核的执行速度较单核更快，不容易造成卡顿，更流畅。
+
+
+
+**CPU个数**即CPU芯片个数
+
+**CPU的核心数**是指物理上，也就是硬件上存在着几个核心。比如，双核就是包括2个相对独立的CPU核心单元组，四核就包含4个相对独立的CPU核心单元组。
+
+**线程数**是一种逻辑的概念，简单地说，就是模拟出的CPU核心数。比如，可以通过一个CPU核心数模拟出2线程的CPU，也就是说，这个单核心的CPU被模拟成了一个类似双核心CPU的功能。我们从任务管理器的性能标签页中看到的是两个CPU。
+
+CPU的线程数概念仅仅只针对Intel的CPU才有用，因为它是通过Intel超线程技术来实现的，最早应用��<H�T"�Ͳ�N�:��Ç� ���m�Ja����od�~L"����I� $� m��%���)������͛����l6c�!{�(e=��AWo��ٝ� ��{¢AҢɳZ�r��%���o�o|�V�Ň?�a>��O��~���ś\��u ���Fg�v!�h�hŌ��j�	aU�1��G�Tblt���~�T�N����Z�@�k+�Lߚaan�F�e!�E    IDAT���L6C&�v��N�K�
+4QME�BZ�	����^Yc����KH���h!hŀ*R�:��n���X�er��1B#|���T���dhnWi,�"��H?e9M��m�,��I*�%�@L����K]^��FX�qad���|��׮��dH��v<��c���*�"��� <h�w0��=����C[[��%DY�2�~��unݺœO>ɷ��m�q��y����{-8r��N�bbb�r�L���C�8y�>���O�\���B\Q!���γ�[܃��4�m�����J��������ĵkט��!C*�
+�|?���kTo��ٝ� ��{�v�����|�2�=�_�җX__�#����g��G?j=H��ͮQ���;!�$��C�v+��:t�Ӷ�d�h�B���111���8�\���M�;۴[-��j���mr��u�_����&R)2�4�L�Tje�Mj�*��*���F�04�V���,�~�ɣ��i�V�D�P�%~G��x��O,v]�&�q�����1!�<�����WnҸ9K�/"��B�ϚH^�Jm��~cr��B����
+��۝�\�����-rA����P�]P3f�~Lb�����ͫ�VW�x�<R�O��چ�����)��k�����UΝ;�����/���˗/���_��L&.R��i&&&���1 {���� �ɸ�]#&��
+�� 3��,n^���޴���O?@J����.]��ŋx�G?�B���8a]�M������NY���=e�����|�{���_�2׮]�Î����볊ۻC��	8�ًg�Y1�~\84�ᶉ� Thc�����=�ԁ��/̳��F�V�e�����/.p��y�_�@����}�2Y����$�f���yn�~���3��,+�4wjx@{{��k�?�?�C��2����+����D��f#^,E��ȒA����BJ��X�
+CK+�x��J��\|�9�t~����v��_�E!ń�.F��r�b�� ��IDb@H����n��mr#�H?��*/�/:� �]��
+H�闞�17K&H��bP�P�4:��Q҄j;�ahX^Y���������W�¥K������u��q��A~�a��~��2B���y��9s�LW�a�]�����:J%11�J������EA0�e���F^�R��ѣG���,,,��K/��/�@rpp0�-$Ò�I�=�ٝ� ��{�"�Jd�677����;������-x������~�R�O��'V�gLmσZ/�m�ώd�=���bK��Р6�AI���4c�<p�>�0l�����Dű�v���%Ο;���%-Q'_*i��Wx�WX^\�ǣ?[��Muy�իWٺu��'(U��
+� �z�'@�(�B��Ц48`�x��!v�W^�$,����8P%P�G*�&[���K���r�yZ	�!4g�]0�d�-m�3�փ��	�?���B#dL�Zc��u*�Sx�,�v�Z�u�qd|HHݾ�:��� ���W.��y�s���/_ezf�0l�J����N��~���������2���
+��[�}�|>�<�C=������dx��x��ٷo�l6~�I�_�=g�Z�s���"�|E@*�fu�y�K|�Ş�D�"F���҆]S����LMMQ�׹x�"gϞecc�J����8J��6E���]=���`���q����ASD�q�=7{{��z*N8�"��0Y^^��G�ʣ�~���YN�>�_���ʇ>�!��r�6ib���Fm����pX�i��'e�HG����f�u�R�D�Y����|�r����8CCC(鱱�E�����&��wvX^Z���W����Z�6�ƇG.RI�(E�~��J�5
+So���In����^&BvBf�,���6&���M �x����Z���s���doJO��gI�J�c��&��B!�B&���ۘ<��wސMt,ri����S]$�f�	��e ��$��}���J���bQ�S�h��pc�P��������:�[5�T��A+���zD[������67������.��/�˧���������}�R�āx衇8z�(�J�B����(gΜ��ɓ�N�����x������~ ��}��ݶo���2��u@*�J��������^�����\���!� pِ �6�w��G���7��gw�E{�S��v�_ow����;��{��$ �	���-���)�&y�w��-�G�%I�{N"�-���x=�:x��Į�ͮW��7:'��؝K]�a����t&�v�fvv�'��	���_�ƍ�?~�O}�S����.��(%��;&����c�n��ug�b�u��X�;��f���S�JFG'��ǳ�?��kWY�X��j����-.��b�̑�G9u�4S���,�)`�z�2F�3�&�
+�l7=��d�����Q	���b�%�yCt`W���^DҌ�	��B���+{��w?"Ph_�M�6���sK��)�{���r�q��t���;@Aĝ!�V�Ngv7���P� G��&Wq�D�dk�2�Gb�Q����e�mmy)�E`=V�
+Ó��"�膦�]��Ugm}���.߼ʿ��/��g��ި��5+�$��2<<���$���q��|<x�C�Q,o9��=�v���=��!��;���}�������*{���@6��'���?�9�f���>��0::��{�0	�c0ֻ�g4�"�ޭr]����������{��l7���M����h\�>�܅wS�{�z ��j�@�u���.�9h2�<�MFo �����0����|��I��5�$o�g�����hm�(Eדn�5��������x�W�����~���~�������۽�����ߑ�=�_)���D�O�$�Lz>��P����:r�'�|�sg�2;;���:�T�98y���Op��1�A
+��vF"B�
+���'�K1����|���:~>O�Rp<��w�_q�����k�B�	�5�[�FX���Q�b	ZuL�N�j�҂le��8U�A}�5�ĵԽ\D�Ab]����ТE�v��bbч�q$$�x��IX���%���R���#�;pe�aü��n���h�BX�20����҄Mh�lH.���"��暋ܪ��'
+��s��50����y&&&8t������e� �X,�o�>:���8�\�6Q|�|�m:r-��0�=@Xw���x�q�d2~�w~���d2<���я~����j��|�#LNN^��+��:�'1(W�)9���f���mɩ���N��7;�m���^,�k���,ص��;}۸�bw�z!�K<�q�:mC�����.�h1M.tBf�����u�O���2i�jT�I���qw[�@Bt�;I�6��a�vBJ��O�Q�.�tks���'���o���?gbr��}�s����}�`L��ݶ_���m �smG"�pc�4��I�xV]�k͈��s�
+Rq��q<@.��V����I����}���~����X("������@4�+m��6۱�j�����<XB�
+m4Zc�C��m�:g��'�����%$�u5^:�`%lS_[c��Moޢ<6���%�
+�ߒt7t��ݱ�h��v�a߈4�:7V�/Λ��M֯�F�hd*�-�1ps��V[��̇F33=���:��Q&C�Y[�4�)�
+U��!�yJ�2~�gv�&k۫H_1::ʩS�x�ᇙ��$�ϓ�嘜��̙3�9s���Q� �EL�s��`o��͞����0�Q���l
+!���brr���|�2/���n�"�J111A�P@l�p��h��a��ڈ�a�}�>w2{=l&���"�[�;�}�&��.3o�����Z��Db=�=���Р��gl���]���q{�t8o����"^��/��v-��C��P���5����w�bC,t���ǈ��nU�%�<O!U'��V��O��>_��y��g������O|�����k"��o��MН}����<�M�
+M<�n7���ȍ�acύ-t<<<̡C�9t��B�F����)~�N�8��y�Pc�
+�҂���&���1hBڦ���-��I���X.&�?"^xޝu<�r���$!B�@
+��*��s�_z�B� �F�+����|�k�_�f{\�b���oava�Ɛ��L��lu~������ �\Dd2�Y��bk��cB�2!�V~��hr��y��,C#���
+�LLS C�ltDC���ݚ?#��:2%��7��ӧ9|�0�T�|>Ͼ}�8}�4�O�frr��K���|��H!B7{No ܟ �]H������b���IFG�X^^��ի\�|���-���O�X��n~�ƀ�@���F"E��{���A�	,[]<������?��޹������$��]��]g��CC��i�ؑv�-)�g�����z�{��`�m��Ţ�4�i�O�t����m"����A��BDa&Wg��T���vs�Du��D��%;�J֪;��G?�k_�*���2SSS�ٟ����ج&�{O�o�F��zu��1v�w&���5�=�r��ו��A����F���c߾}�C��vQP�.�{��phZ��$0y?�j�V��9��H?A&�(!����#HEW�4������I�+�'	f���t�T_��t6!ݐ��uo�A�j���������'�׷ژX_iCN��]E�Z�{4ZE����д�}
+F��V�,�  %l��l5��YmB�jRFї�36<�)�-�&ӗ��_���cjj���!r���=������}��u�=n�PQR�v��199�������y��Gy啗��w���N�?��?�������V�Et�v�fQn�&êq����[��^w�<&�ם`]7c�]�ݦ�du����W�\c�%3����}��;e= �ob�����Dg2��Y�n�$�]��[�Ӊ�wee%o�ݓ�����c�a�7��c��1�����$�y��s��ȳ2��:�>q5��A��@b�[")%�ӬF�k&��am?횭����;+j4�rg�Y�x�7�h �@��u�Uyg�������.4A�!�_X"�####<<^�罶6y��y����5�Ͽ���8���������C�\]�ͦJ���s}��]�p.6$�8s�8�*#Aj��}�+���-���>�c��PR����@��z������a㜋�J<��k�k�r��$e�~5I
+Z$��s��`i%}�����ikӭאx���������p�؅����ϏXC�t�������i�U������]�)���!���Hkڭ6BH�|��6PĚ#nO �@�s@Z�g%��)J�`Ce���I�9���$CCC����(x'���ƀ����?�ސ(䂀ٙi>񻿋�y��e��������;�0���y�tGr�!Y]bLO_�����������_W	���^2ʯS����z;�7.\�un�J��1����6_���] ���/brL�p&�cn�H3�֨ޡ��&ɾ��o�JV�W���"����$Þ%?a,��.���*_��_���|��q>�����%�=
+炳 z_2����[��/��[B|�jq�*�ؘ��*���z������l��^!9�=n��'s�����:BI��9�c\2��ցuEX�v���]vwv�W��̇_U9f@d�dպA`�+>��˃8~�j�+ R�ݾ����v�{E�O*ߝH���M�givvw����^۠az�C{~��J��� � H�*��C��`�n���-�^�����'�|���a=�E�B2I �������G����gdd���"�Y`�����~=�k8^_Kގ����哟�$�2� �7��������t�]�����q�<m��{Y�~�"�B���W�{����������vz�}�s�>}��=Y\pR�Ƨ�1מ�m�$�������'w�o]b����1�-8RA�1�VXm��C%�ػ`����8I�- ����/�������i޾t�g��-���{��|���/~�9|�v�	�і$K_y�pNb���gY�ɺ��ŕ2��I���,J�-{�����c�A�i���b��sW!P"n2N�KҺ���� �Z:�6Q��綌�$f[�dm�¨K�Q#\�XXX�2\%_*��>��H,��,6���ZL�a�"�C�4HᑯVa�2�]Qd'�����R����oX�IɉCۨ�����7.���JQ�'f�C���S��Mnh�#��0{l���]��$
+#:�ˋ��<�{�G(�cbj���,�0A��9�g�g�!4��h��)9r����hݫ\�_lW��+���@ػ8�/�+�ц�b�����np�L����O9��#~�je ݉��o�_���h4vV�'?�滢�^�K=�)�PE�9f�������ey��-}�����鱬��?6b�s̞�B��H)P���9[M��n�������ݕw%w��!p�ТM�͍En޸���<�F�04���-r!E/�����I��
+��D�y++b���Kb!l��{�^��l��^�tO)�t$mKZ��Ú���/!�el�������k���R.]�"#lւ���]{vQΘ���ٰ=J�]�R�B1���Yf�`xx��{��ﺔ~�m�c��N3!3�v��Z�(�<a7��[�Z� Ec��ʢ=C��c�l4���<�[W���������'���3�R.���r�}aM�T�㞌oo�{�0�1
+�v0a�,2�C�y����q��:�+������l���*��z�kW�������'��$�v��DL��V��n����h�י==C���v��X�g���=�.\��ܭ�aȹs�n4��8���������ƽ|ǒ����I�v��N�.;����ɶ���� ��h�oC 2V��4X�����������z����(@��.��XK�����F90��R�מgs�afBp��)l֕D�:�"b��$T�/�4�{OUQ�'{�s�u�Nw�e��?��fA���d
+��+-��P���i8F1?B�6`?�?"�bw���] �~���22`%�K&x�������֯b�G�{A)�:CY>+V��UJ������c*%��-ʓ��ZCRjA[��ӏ-ktJ�a�^�)pc�V�L|-	y �+������Yd���Z��u �q,$l�hc�£���ٔޛ�@B[[ԑ�zc��EK�ab�X��|����?���}�l��d��2k���E��"Ձ��Y�g[��,Ʒ�6�iZlv���1OM7i�.���\�v����x�M����p��q�>� ��{333��������~q���sj��@$��kT�����Bԥ����ͫ�J"d\a�qiJx�|O�;�fe���{���,��>N�����v�������8~���q�^	I��X4yc񌡘/Snl�osq�uVk˼y�5^z�E旗XZ^dkk�V�������q��Μ<E�P&ɐ��%-(��#]"�Q���6!!ʗ�9r�\o��a�������=�i��V��捋��7�k&��x��gg�&$�M frL���x&�ҕ��3R}+�%��qx�;�m�3��K	9j�\�g��� f�gC*�»���gtb|':<��L���׉�{aR��X�1Q���u	�a��1���8�$�3�x}�w嗕� ������O�U2�UZG�v�Y\��
+ꌍy��*
+�R>�hǦ��L½xqo4�	Zq|�
+WH���<����>ֺ�P�K�I�c�܎" G\�L��K���Z�g�}�
+�QJ�Ֆ��^��++0V���dIY��,2�[	 #m�k�EkC7T������di�:����QDR]$q^�+Ͻv����[Ԝ!��mdd�V����27���P	��l�$և�3t��z��Zm����4i���auc�����ܸz��.\���p��Q�=ʩS�8q�SSST�U��2���v�{b��F�ąK��
+�\b6qI�%V���oU�!�L�Dyl�`P�������Ό�p��7���SǓU�����ĕ    IDAT �R��[k���`c}���!f�g��<�#1�9Y�e��P�>������˗������嵷^#�n�0n�"�Y\\��W^���!*�
+��0�S�g�F(��-�5��4֙�\�m�x9Ei�D�TL�]z����;m��e6'�	`I��n����
++�י�����T��� �u�EmjD�+����,Wj{j��bV��l!4� ~���"�H����X$�����e<�ӱK� n9F\b(Ô%�گ<�Ef(-��a���{�L�%�X�0���%�K�װ(,�
+=����ǀݕ�*w��*=*��:�%}��]66Vi6�8|������k#dl�-|���8��=�������N�Px�Xb���(>��^�GIL��wi��T�v�DiF���$�W� [��
+C�IM��W��܂��Z�"'<�$�묍D}�tf`�&�	E/ %�P�35U���bqqD�ӧK��E����}�vR�V%�k��=�cl|c�s�-�˃��!BA�Ѩ7���dqu���E�AWt�n찱�A�Ӊ���h���kk/���/044�ɓ'y��8y�$'N��ȑ#Q((
+�����l_#��51&/�_"Y�,�_.a�D���IW^A��ֺ�@A�\F��*s�_R���2�������"+���t����i4�={� ��+	!x1P7ڢ"�����xn���k4��l�8�H�����>������T�Uf��T� �BbQ"D�%���P����-�v���c�a����˥}�=���ɝX��Hh4v��\C
+͡�
+��5a̲:=$��|ۤq�BH�.�!�.�&,��G��Զ���<&)�lT�����PR@"���䤪["�B']Fc�/-	��/����;��'-��X�%nOgl'��3�ܻ�"���[*%��I~��׹qÒ�W��:��i��|��+�A���M,��Л�"}i��D���7�C>o	P���N�	lƬL�&acP�E��t�`�u�CR86M�ҏ�/��e��=�J)�	�*��!��~ﹶ�-V��ю!Ѥ% ���'ԁ����)H��8\�����Tm�� ��Y�6׾����I\Z:�c5ż"���n��t���&&|���c�x�w���a�º� ��=.-�R���)<��7.����g%9�����۩��m֨�Ml`	E��,A�gpd���t蔱;g|���x��x�������w�}�={�'Np������(�r1x���1(�J��'fr\�Q���"�]�N���TW��P-!����[�"���i��4鿉w�}\i����T��g|�,k�k��h6i6�(O14:���taA�Ɔ�Id�!M�Xn����Y9��;�,�,ю"���
+c����1=5��loo��ϱ����#ʔ���5���Z���-n,/���NWu�9������w��S��W�*�̑�.!d��Bvk[4�����r5�D� Vk���(�c��8��X��G�����F�ȸ�
+�c��b���rn�����(�8�'\i������H(<�Fc��ϛD��P=��2�*;x����0�n�&�{R�F�0X�I]���$��u&�Bt]s	J�o���<#�(]l�y�}��'���/ك>�)�,�q�њv�����@�ё�2rĎӳ���.+��Qpi]���8L���k5�vb!�� 9�W@
+�1�;�E$ !T� ���B#� �,?��+���ȑI�����8Mֻ�d8�a��������Jv�Z�j�6��[\�0������ ���1R����K�Bl��}$.0��RkB��~��� A0W��o{o(i�dL/�/���0X�r���\}�
+׮ߠ�[G	,hk�0ȼd��,fPk=��{�q��WYY\fmi���5�w�	��X��ί�n��k���[oQ*�azz���fgg9t�G��رcLNN�^�D�8�7q�	���V�����7o�7�F]Q�����b�9u��h���$Vy:��^�	&��(�'? {ѓ�9�0$��!��3����߫�j��O�4:A�)`@�.��e�k�.#�He�Ǐ1W���C�#L�M01:��P�	|OR�T���X.���1���䅢SkЬw��"�.�E�#�q�}g���c�l:�zs���~e���,J����W�ۡ�(�ʮ�}J��x�ԙ�5��H�⹩��T
+v�:DH��<l�"�t��و����j$X� ����0L�~�JX���!B�,��V�����婧��ȑ��p�1�ۻ|��ƙ���%���V���ϙ���ȱI�DQ�R����gֲ���4��u(�{�i5Y\Xd��M��<�/��J�"�_��`��y�Z��1���bM���*"��L[����֍H�$A�-�����������.����瘛[���×^�.��(�̅W^gcc���q�{�~��++k�ϽM���C���9II��r��<��d�2���8ք�� f/ M�K��eS��\VN����Wwy��鞃:�+߰G�e�u�2��H�1=� �-[�[t�ݸ�;��f!Y3���VJ1P���c�*e�&'�XݤUob��|
+����`xx��D;v�x���en]�ŵ+W���c}{���U����v�����t�v�4677�����W_M���$333��dfz�ٙY<���r�|����	0���X\٠VkR��T�<�Ǉ�:��vG�]��޾���1F�ᗃx�63��n3��ǀe�mY�13!���+E���ܸ~��7�X\X`|d�|��/�f��16z��e����8��ãC<���/O�P��+P��)edd���QFFG)TX^\aq~���Ev�6ѝk=:�@�C�C���Խ�:0E.�߻Vgg�>A�I��M
+�8FKG]����kc#7�IB�3�0V"d���].��*CÃ��LQ*�@�1)vw�}�5vj;�>u���a���q�*���6/�'�/r��	F�'��$����,--3::ʱc��^��v��?|�<ǏOq��8J: /���"�^ϝ����nd��O_��Ö�Q��=��f�I�П���'ϭ0�h�1�[.V��Η���]���. {?���}v��>Y
+@J��K7u	ѳdmJ	�׭u<�N��^���f�s�<��#S�4Z������^�Z�Ï<�x����x\|�m���q��cc����h�Gʬ�����llԸ��*�|��0<\fff���6łG�k�Ba�"	�)�ɀѴ��J�@��������f�z�Uߋ������=�g���)��XI��M/�����Yv�H���Ҁ�:�V	
+y��Fh�6h���Q��E
+E*%|��`�235C}��ƽ,�/2w�ss\��6��lnn������N/f�����n�����ƍ�EJ��2�Ǚ��f��A��24<�@u�j�Bu�B�<�@����6�с*��A
+" 0�a�K���tX��b�����ITN���3�~�&E�{�G���mj��F�Z�N����n���-����y�&��nEO<�8'N��̈́$� f���wl�	��-C:��y�ك�D�g�Re�:�P������1P)S(�}�b�He�Du����
+�vm<|�H�Pfhh���	�T��r1��}�>x�+s���ݺ���5�0Xd�W�,fr��zD���kYZX�?y���Σ�:3K��{.=�6o�y���y��2c)���dg���������"�������%._~�7^����'N.��r���af����M�k@x.�5�u�1�}�A����q�Fc,���j�^�r�z1�{�6�CLg3oCb]\�цn̜�>����Ҽ��'w�o\�cf��&٣�����f&��"�s���űJE�T"���ߦX`jz�|��CXC�eX]�!�@xtÈ��m���g�|y���6W�\����OQ�B����f�0����?08Tepp��'��(/p�Q�H�Cq#]���$��0q�I�.Q�9F�hgw��*�#��H1ş+�e�1�6�ݸ~Z�"$���|�M`WV���$�.F�t���|�\>���0��Z!eC�fb��9�A���SӜ<q���m癛���[��ys�7np�ƍ�B�N�C��a����0L����W��b��@���&�'�����$�SSL�O262�Ⴧ���&�sе�֘("��Z��beg��k+*'�kr@:�����K�Yp��Y�c}��6a�l6i�Z��mڭ6�n�[�󬬬������:�������V�n�C�Rejr�ݝǶ&�&�I�U=��pً�+��ic<A�T�08�āIf�151���~PD�^�y��r�L�\djv�f��n�N'��*�"�P(x��6�����l�d����H�JD7�vDe��FQ��X���.
+�ON�o�gxx�����	<�9B-��m���C�a)��ƪ��\|�?��y��;����ƥ5F�����˚�����~����CC�LN8w�0�����T�z�ȱx*�pK��
+O���U�*2��.o!@z���I������1�l˞�r����������889(k�����xWރ�`�Q�R͖Su�ĵ86"MÏ�`�Y;R��i���
+�D뤆�B����g>�4?��s@���6A���!,%���9�)��B���΋/��s|��������Vז��W���^�	W�\�̽�x��'������C�ϓO>̩�����_'��ٌX_o�l���,�j�|^f�R=���lti4�D�%|����GR�VkѨwBR�H��:�	����6�;�()�T(|<�AD�89��)��&E��N���TJ�R&�0�Ks�߹Ģ���_` �8����tv��@ga�x���c0F�E
+׎�ףN��~�Q(1=3Źs����իW�z�*������p��M���X]]�^��!Q�\5I�tk-�1�N�f����b~~���"A>8p� _��/�g_�SOϠ�s�i�4B��h��
+�^��h����[�^�:��{(%\�si�B)�<��(��6b�B�9_!a�ۚ�&+++,..r����星���������v�k��`�&�ۙ���[[[��5�(��|�����g�[��*�F�]S�-��+��
+O�����Q�y�\qE�o[W�W���"�b���0�J�Pq�5�x'Y}�6fY0��(�����J�r	�un�R!�s#�5ظ���1������G
+����`�����K��젍K�h�ÈBUrm�Hc�t���5�{�y�G���<��/���G�q��	���_�X����ޏT��^x�O~�I�>x���2�Fk�ak�M��k�Vs��>�g���*��z=�يH*9�e��;u=��w�ZS(**c%�(ꍐյa�I./�Vr9h�I
+�dSꍑ.R
+�����2iFe�~�	��_��`��j�����}�,�5M���#�!m3���>���`��D�ā5�u�V��y{�i
+p��*�r��l��i	õ+��r�Brˇ?�O|�	����?q���|�&����@��F�|�?��e��k\}��V
+<��q���`my�o�ó���mr��&�c5��'���'\c\kJ�r�2����<���lnX��O�������4�������3���"�A�'>y?_���R�l�y��ܚ���~z	a���<���a"�TX��(gU
+�IB�SN�@�A(W�J��*@���� ��µ�Ċ-V�b��g���ߤ�qN���g\������t��˽�PLLL0<<�}�����׮]��͛���������&���,..���N�V��q�DGmM���1�@�/�9q��>~���1d�C( r'`���q/C����c��٭��o����m�P.���)����P`ht�����,ݺ�nm�W��tX__ggggO|���*���t�]��&��`&�:[��h�b����~��Ϙ94ý��O ��Ã��T¹�<�������;K��5�����Y�����r���u�^ʽNw����P��P��u <K������[$ے� �-�	�����|�uF�T���"qM��t��bl�$�0�����j�3��cp�J��XYnQ���ba~��e�ֆǭ�-�� "�\�������<�����_����E��^�#��4vkH!�|i�(,-�R(2=[�����c���8��Ο�-���������)���b�v?x�%~��7���:���=}����c96A�������7h4:�{�0��̇8x�~��qk��n0����J�C�>�'��ܹ�T*~����#s�`�U�J,��z��D�K6R�����d�siޕ_E��߸$���L�>��#�����r����`d|���^6an\%rm�������Y.��ar��Ce�Z�gϽ��j�`yi����⿠� _М:=§>}���a��63�x����2$2�XA�
+�J�Dm��~�Y��6J9��y>ssK�>s��=�a��s��������Ꮜc�@�lnՙ���O�r?�!.�~�W^���`���'��|�H��?�A��А�ڭll�28���=Gy��s���%�~{�щ*���`"M�:�8�Ȣ{A�Ɉg}�颷_�l�������̿����w� �� u?)�PJ���(�Jr��ivvv���`}}���E666���bss���5�����ܦ^�ӎY�D�c��\���	fff(�}��Q'�V����7PT9|�z�W_���u�p�� �"��y��V�A7�@Ac�v;Z�$1m�^��C�1A�y�\������h�ۼ���A���i*������F���rg�����n�h�0/����d�怩��� ����M>��-�����I��g���3x,�~/i��z���LB�������]gn�Ƨ?�!�����/�D��n�����6i6,�=�R�'$�>v��|�q���9Ξ����"2ms#F ��1��_x���m!U���h���x≳<��#,.�r��Ox���T�L��-��0�<��#<��clml��s���9*�����}�O}�3K�B1��(�R\�v�����,�F�O��)�_�Lu0��玂֙�2X�0{�/�-a���1P�V���|���. {_�&lʀ����1�r��܊�*\֢{(�1�r�CG���}����v�L�Np��,cc�r�����������A13]&(����$Ŝ���H;�cM즓>�I�����*�T8s�Q>�ѳ�~�����}��qs��<�aE�02:B�+���u�׆y��+>����(��X]���iL����"�+:|��>�#�9u�����ܺ�N�Db7ǁ��%�0`1i�,b���T�O�������/�[B� `xx�����Ǚ��rA��f���]���Y^^fuu���-666���dk{��R��t;F�Gfxx�����;����S��Fn%�@�s&F'�R���AcwA�s: �U�;���P�"�GJ���(��</})���\.�&!�E��2�j�R�Dy����.׮]���bx`��W<lL[Ӭ5X�\c~m���5��I~ ���3���<?�������~����=~�A�칾�X��s������i���Y.06>Ƒ���ﳾ���L��1�g\��f�n��F`8~l����x�fp�0:2 �4J	r�G>����ņ�0V�y�g��FI��Ó<��>���6�.]by���V��Yh����	�p�ry��YXj��P���7�\���4�=�L��B���h�6L���3<��YLdh7"ο�2���<|�XN�b�B��+f��IMvoߒ�=�}"n�w��] ��$Ey�)�/�!�����v�mp�f���ŔB
+LM��/���x��S,p��1{�A���?���|/h�4����$�v6�薳����^���ݨ��=!Bx�M�V�X�@E!�O�p���E�������cj�.�SK����;;�\^z�Z-�������v�b���I.���+�\@��?~ ��ؐ��
+ǎffv�(�s���2hV    IDAT��m���u�l���]�mbkg�#�;A�<�m��a�� �}�5O�V(az����`���]vvvh6��v�lnl������2�;��.s0|��A@���҄����ƻ9w�'=F�G�`~~�V����٤_����:�JK��t�U��U��TJ��~Z�?y��\�|>�nO���� ������dc{�͍ud$���64�M�w�٪mѶmdA095���ǘGI/�v&��z���"��"���ށ���3�fH��� �>:Ù3>[������̙�|�i7Ћs��� ܸ����8����-�V+B	I�V�^�� ���Z���k%�˫L8�3��T��8����xA������]�v� pziw���Ņ�lm^e�泸T�ٲh��O��ʅ�����Y&��i4""q�}�9q�(��'�S�N���_�V����&W�6�yN{q���)(~ ����7w�W�� �}ћ�b�t�aM�S*��h{ǉ���vq0��!Fw�:����al��-�Q�Vw�v�qx�|�u�Z>��2PB(A7��������%��c�L�:Nhb�F]�0H��{Xq���������N��2PFI��9>V������>�c�^}��|�C<��Q*C�nI������R!q��hM�ĸ�[j��H����J�^�mF����ۗ=u�2�Qv{����S�V�V����P��i����u�wv��٦V��[�a���֚z����0A.@z��]�U%b�t퇒`u�-F�*�U����"4QzN���j�����r9�>���|� ��U��<�|>�2YIۥpe�� ��!��R�D�R�R�P�V�R��k�u�2oݸJc������gE#�=4�}���'����
+���}��?Gy��{gæ��*a�%�Jή��BE�k�mRt��0t��j��B��@vѺN��-��]����(�,x���
+��	��r�0��B�PH�iA!�G	��*֝m@���X�i��j�	i	#˳?x��_{c%�1:��vp��-���'��I��W���7.��g�䧞�TEH�6.I����˸t���)H3�Q�u$�m1��������w嗒� �}��������!ɏJ�_��u>RD ��0q�q�X)�Ê�(� d�.��\�>�_���/��+�y�o�y��/������r�d{{��/�h��ӯ|���^�87zB\$v���$�ՓB������y:�=�Q�>x�\0��-����5F[� `z� _���s��i���̷_������>��`"�)\�
+"c-="ű�\��%a6�+k=*>J}���Y���km\|2�����߿�C�X�X(02:�)K�h6��Xcaq���m�c��<&�t��z`d��"�ۚZ��v��g�	��'�F]��h	&.ˠ�kr��v6���y��/�sے��B���JY: ���s+�˩��T*��,�,��eKҢ	(�0{h�[7�YY\�ՌV9*�2S38xx�щa�yku�>�jR~0��oN��2�ؽ��xe�'�:�����ӥV�}E*�Tdc:q�_����m�"�<����3<�����e����=� "�F,/��ʅ�9sz��}�#�s�q�G	�� ���I?]c#w�Vb4�l5��߼�'?�$����M��l�YZ�|t��Tx����g.r��?*^�ӟ�2)���V�j��\ͱd����6u�1`"	������Ez�7�__E��ߨ$��-��� Д�o%%�>�h�$���p%GI�U���*�p��n.���MN��fxx�-��).�D[B����O�2.찵�a{����n.,���#�<��F����<��v�~�:G�q��cdY�V���\3q 6�Ú<��FC1_f|x�z=�;�|���u�8I��fi~�Bn��﹇7.^g~�&:4ȸ�@�p_���R��n��P&�M�Q:�{�n�iz[�W��ݿ��%����+� �v��o�����1JAP(�V�288��7/ќjR)VR���V;���#4�!V�4L���.�n-5CCC������itۄր�B"#�L"Y�b��J�X,����y!(
+)�*
+i�}���'�ˬ�r�|�chp�|>`dl���ݮ�Q�)Ϲ+��Ky���ڬ''�ڤ��ʝ��8�xCFdtf�K5dG�4�x*H��D�Mn�F)I������,�����ym<�UX�	��L�kW��ַ���FKp��K�kt�.�+K�ѡf{����yv���-~�ßq�=3<����}��F�8x+��|I�k[u|Udx� �p���|�-��B��;�]����:�awk������ִ��0]��b����>`ec�>�Y#?�J�e�ʾľ��7�f*ܕ��. ��K��أ�a��p'�$�YL��p= �X/iU`<�,�]d~n�Z<<�iiЄ ��h�cJM�S
+rܧ��&Wl��c�8}��F��]�Fu:�&�3��(���~�ԌT�H� )��by���N��+�y�g�~e)�+k�X�n'd���^)�y����B(�HiB�����A�^E��Iw2f{�?[�(�{�(g%�zG� ���v<���Ͷ�1�� �����eVWV�P�������,��D��zc���
+k�5:�������B�����
+;�ƀ�B"t┲��PB��IJ�f>fA����Q�U(�}?�M�%X�1������ �S��%��"�#.�������<����������-�Љۤ�	#v�'n��À�<�=���3%��\�=���׮2ws���<cyZ!<m-V:V��@��>�B���p}�rE1s߽GDCj�V6�vv�>0���0�J@>bfJ8����
+Oz�vn�>���ݜ�o���R�F}�N��\��gg���]����h��0:Z���Y!R���J�ƽ%C�f�ce3:����������a�[�/b���r��/�N�'�bBF�=�b�"�a�G/g�O���?c,&���&�k��~�C�S��<	R#=��6Mu���>���;,-n3P�p���C������ Ea���������_}�qf�����vy�\!d���j��>���az���M�E��G�Ӫ���׸~m���<z�����<i��s�n��]��s���S����'O�39��F���ũ������+�oֳ��=�.NBhl̄�l��������K<��!�a�﹍�����[>����\}�*�����R-V�ru�0ha�dH�vXܙgnc�����R,q��1��8F�\c1֤Kd8KZi���cVd�wr]�Qp�qڏ!��º�2%*P�sރ��<�Y�ǿ� �;\�u�:�^(�혂�d��^,�m���d���h�ys�Ba�{�;đc'�<�ʢ<��4�w��u��ӟ��j���5F�<����ȇ�`l����iw�r�:?�A�{Μ��G�2<2@�9 ~���GJ�$Q
+���We�섦\��G�q������Q�T9u� O��9qb�RQ��||�����,��S��#���˙�3�NS*z`5RBe ���)&'���ξW�>��Yb7� f��Z����ݕ_M��ߚ�U8���'Y�W��\6�%�I�696[BW�j���ac��9s��O>�SO}���!��aL�B�cl�"a��>Ţ���e~��W�3��>|ƹ5��Rz���5�S��ɀ����Q�h#d�֧R�����a��:RDT+�O�����G�+��Iq�G���ϝ�Z�R"�6?>α�c.�1r-s�����	�2tJH�^������h₅�F=ǯ5�}J��S _�Aǝ>�2�yH%��w�''È+o]���pd�0�C�H�;�n;��ls���s�v��r���g��4��
+�L:z�>������~ �-���,�:�!����,��3UW�Y�o	�uGI�@�KW�L�Et%�3a�Y!\	���@ �H�ex���?� �>v?��w�|��y!ժdl,G�Bt�A��Xv��s�f}�΃=�G�Ì��@���H�-���yf昜���Q������
+Ru��]��?��'�ֹ�m����g�9v�_��OR� ,B:w�E�������+P��)�
+�Z����]6�L���IN��Bv�:����1��jcg��[I%�~�Y�gI��3�}�� � ���Y�Rz룵��.��Z�"KALj�����x�'O���r9c��)����ϩc������t�S%�"�x꩏����$_��@w1V14$�ħ'�MJ�<����+�!d�YY��)��Qr֙��B�x5��َa�z g�
+�����������)�{�D�=۬.n!}����G���au���n�O�[&�&)�J�߸ŅW^���@�0�5a��]�Q�����c��'N�`�ZEI�(8�H��&'�1��� ���Y��y���N�]j߀*��/���H��MR%�mKj�R�L8=�0~�DLLD{�i�i����юi;��H��<EI�(��HJ	� � v� 
+�׽�y�y8�d�u�H�
+��(ԽYys97�w��nJA�m���=7�yQ��\57�ޡ���owV�@�D|҆qqSY��6:��*�[�9��&�'l�uM��f�g�������o0��P�Y�fdY���!~�3��niC��i��Æ�k���2\&d�Y6��*Ռ7��q�T*5�5��J&�ނ䳬1��ڇ��r�Q��%�(.6�	�����"0�P<_EEai�n�"$[�\l.��V�㜢؈4S�
+�Bf��z��X�S��{�.���ԋГ/���vU��J3��Z#�tBƙ��P��zk���;-�U���5�eK�Q�,�W��\�CM)ҕ!�bjq����)&f	�	��b�h��S5���V�P���H���r=�I�k��/��Bi�ť�*V�}�٠�dٕ�F���`c�.��\��V@mDUQ��8:B���>��U�:&a.�R��g��-Tku�|�MΟ9�����%�6!�j�uF�X�i=���fݺuTjq�U0��[�^~��b\��(��e��zE;��g�Z�Z�a��p.]ռ���	V�Hb��π�ap��L)b3_G�BE�^W*M���,A@"��� H��K�e�q��WQ\C��]�5��7�;�R]��$-d_ C�"x�x��G��z���L Q>)$�v��<�˽���w.K��*��`5r���{͏���.�Ct	���� �e��؆Pd�R�18<�ɓ'Y\�4�P�y�Ehf]87�f苡���ڬN8��d�V ���'��15�Ё�	ɋ/E�RT�wבa�M�L�Uwi�}��!�c�R��%����	n��]Kh(+�b�E�� ��u��@�v��9%�:�F3�YX�,.ZTM��i��Z�Mi;�u�(9���� �=�tù3�p���3$�U}�}���0�n��u�Q�Yw�	\;>^h!��me���M�)�~��.�080�����%륢�����W�q�)!>L=9�d���eP+Y��"'����r,�zs�و��>��w�����1��4^YԠZb�v��B�e�4��A�܆�W�r�$,��dg8N[�e���jZŘ^����fq%�]���z^�e�%`���!����E\��E7k�:k�'9s�0S��Uap0Ƙȹ����.��	�����L�ό����?�2g��B�I�/!!%!`*�X�Yq�Sd�Z_�P\�	��<�/(1HA���Q���Q�[ٜ�5@�o^�R���J�6ZߗJHLM�s��33M_0֓b�$(��s]ȦK�`�@T�BW"6n��ډq�ff�_�s���7�G�@�Z�}ZJ���i��1�pMWr��;�j�����ȫ*��C���s���?ߠP�T]���#E6ϒ�$F�'E�I����\|��q����D}�@�]q֕����P��&X� �|F���,G���q�h�\~�����@�Ơ5�Z�b� *�ˬ�-V��=W�L�H8}z���Yj@�FUsy��h����N�%`�r3�J��\�)���f�34<Ʀ�;y뭗�����@�jU�c��Y7�PCd��L�X�*mǕ*I������R_3�[��@jrMO��W�A���$�z���Zg.�!�jD�e)����G嬺�Al!<C9���N�ǍY�Q���-�S�R
+v���u"fnG���RN��ɓ���e����7D;��i=�x���MSV.?����l�J��h�(cf,�ׇ��gJ-F��u����.W�ض_J����W2���*����_�9�L�N������#x�գE���T*>�@mn�B"D�)��ûp���"bc��f�aL����#"`3G��Q��T\�yUT����a"�,&�*��x�Jn�eC�<,S���[�	Z��!H&�o=��I\PP����J2.ȣ6׊�B�4���nr��Ν_���J��#>�N�>�n�ն�^g��D��]P|uoq���J���������믽���El�p�0��$���"�+ւ�YY��X2M��0�%ZG����v����
+1�I�l���]W;	QW��zj4�j�x�9����P���NB�M����5�h��6^���c��-��wl�E:2�LR�K6롧o�M����7���}:+�cq��Pg��^E(�-�\�D[�w�8�9�M��M��q�Vn9�\RB=asv]W|�j@�Z�񖿢��*�rU�M^�Oɯ	�>G��9�?0̍{�������櫼��1��|�D�0/j\ �b%˭�V�D�Da��:Y����b��k�"��Q�V��*�ԕ���n!���&��K�q2��.����Cׁ#�R���ߎD��e��)?Oi۶p<'�
+k���m���B����F�P�06��͛�E�%2�!\�+HW�.{��n..�_qY>Bi�j�^֌m 6u�Q�x�u�{����ͼP*Y�������Q��̗r��}�k}��:���2*Eb��~b��k]�h�Y����AA�b�D%���]C~n�����+�h�]���֧���+:A
+�+��eamD�����v���͛6R���+Q�%"����.�U.�VPt%$��}��ώ����Z"�r���Qđ�m9��s)���d��z�sg�C������c�g�"$�S CI"���7Jec?Q4D��֑78w�����y�AfHa��\#����wr�[��e]+.8_B�X�����7(�����h��yƮ����d)}O�B@�J��(��}ot� ��?_!(3/�|�G��Z!��'
+�*�1�4��Gز������ЀW�Z�^�/�zzx�[H�e���%�[|t�NPb��z��#<4;gp�S�e���q��IΞ=C�L��s��ΕXXa�T�N[K�Y�R��}���<�̳=z�Z���7����n��������f��@�Z��-������ʒ7���F��M빥[K�8TPX]���+�jf�v(�����9n�*�:��kشq3#c���m��0�s�	��/�8B�P���[��s?"��i�X��֔6�VT-�7/��S��K�揝_�����\wX�̸�_}�բU[AkE��Ο{�3gN15u��f��iW����>�֫��,����H���|MB��z��k��U��
+����;�[oe߾}:�:�(7�x#��r+k׮#�b�;�PB�dFRZ������q�M4(>e��I!���_���ZCo���M21������*��pZ���T���vb��ѵ��/��/[a��}?GD�(fx�����w�)��+>S�୪1E�+�]�GȲ���)~��r��k����ر�6n�����!��	����"yI�tn�k� ߿���,U+ˑ�h�1D��"�.	i������:���e���������-���x�Q,u%��B.W��]wX6 ���+�X|�==56l���I������G�Dh!6/�}����lQJ�C��*�����#�8v�'NG1�����s�M�[�c�BaɕZ�ln)N&�7&�<,[l�מ�Vv;J��������    IDATP]�����
++�B�vc�%���J�܎%L�P��Z���4����|�����ٱc=�i>���222��lm��E���ˎ��F�:�oGV�Ŋ���	��o���;��CC�����?��$�h4�<���LLL���Q��cU�q��8W��	��5^����O����N���Ch@�R����)~�������<���l߾�/~�|��grr2?FȒt�6/�G��.���z�汎����6mbÆ9r��^{�Ç�h4زe����pQL��K�v��S��w�.[��9����SSS���?�����x��g�����_�2����پ};�J%�6���]t�E]8Y�fE����n�:��Ƹx�"G��ȑ#LOO3>>��� �J�Eή�`���]�Ŋ(�����mvv��{�o~�<�����/|��|�3�޽�z���p�B'R�E]t���  �c������������Y>�o�A�Ѡ�����Az{{�r|mW�^�x/	X7l�=ޫ�,˘��������'��^���C��/~��۷����C�Nº�_]t�E+CUɲ�%�����$=�}}}T�U�x�	~�a���XZZ⮻�btt4?F��l�<q˚����������W��U�q��*��w���ƍ��,˰�.3����+�.�袋���e����y��Y�nCCC|������i�<@�R�&�xo�%`���+��h��~��/�����T�U>����|��7���Ax��ó,��(t�E]��`��V�DP\�������exx�o|����?�������;��ՏU��Jө$�J�k���)�~qq�g�}��}�k<��#�*_������޽{�V�-��[��N���F��Y����屢.���C������@��\IvV*ٴi�z���~��r��D���QV�%���\r��h'"�۠���v->+!�2^x����o������9>��O�/}�[o�����|�K���}�o�'�w�E]�ѮH��Dl���(�ebb�Z�ƹs�x饗8y�$Q18�j�űsRYk[��*ڋ��q�xV�A�W����=�)��=s�Z���l69r����w��~�����{/�Gĭ�����@�P�\}�=E;l�ڮ��.�x��#�R\-V��zE{�졷������������c�eii��z�n��j���Zt-�������l�s�a�Z�V��-$<�	ܩ����Px5MSN�>������}�3g�p�=��'�'|���-_�b���^I{�Z���.�x���E>d ^���:3<<̶m�ؼy3����>|�f��l���>������ö�r��]����U�^~&n���j`]+��ѣG����{������9��>���}�Z�|9e:�j�畒
+ʙF��v�E���Wˋ����(_c��Z�����ټy3sss����߿�cǎ�q�FFFFZ,aW�=]��(����Z��.�:�w�2~_.��Z��p��������ۿ����|�K_��{�epp�cPh��_M(��;}w���袋�+��N��Մ��5�P�VY�v-c8u��ĉ���<8�j�ӗCYn��7�Z�O7�
+�R�P�������k��`�p��I������o�ӧOs뭷��p�M7�1/^��/b 
+mё�7}��J��������夺�.����j%w���l�$	Y��F�-@�q�\�' �Y{���h`��G?��?�8�Z�����>�ڵk�ٸ�pݕJ������:�ƪ$`�Z���mff���O������4i�b��b (W?�(��_�G�ǁ���ঽ7�����coq��QP@�#k#�`U��������3��φ���]��B�@]t����3��4�x�"'O�d~�U�O��7}y��F"���$�
+yl��U˶��رsO>��=��4eaa��;wv�y��!"�Y(�j���A�z���\��� �Y�t䒐,�.�-^���B*��)���կ~�׿�uΞy���*�
+jc\z�Uw�[���)~��H>����p�_�.���.;' �����8��Q.NO3�f-�v�����j�ڽ�JR�9�������t�����t�.5."�f3avn���q>������dtt�(��'��X�.��❠]n���*Yf9}�$?�)���diq��z�J���r����k�+Z�EPEU��m@�)�b0��鹹9^}�U.N]`l�Z�n���Ȱ�^�5�8�E���k�,_W�GV�� A�竪ۮ��3�	��-b"T�ړ$)s��lܸ�����v���\\㽴>�B�ŏ
+�%-�������#����}�q����```1�=�
+�n7��FI +`��O�����$�VJ��ո��]��O�[QN�?��9lY���#&�z�,����D~E�M��:��j1����|�|@������b�$�2L?����G�����k���'>Ŗ�[ݾb�\F�t�E� r��82Q�Cms���^江��c���[na���j��ɱ�*nñ/'ǮT��+[i]���i�~p�^Q��Mp�K�4Iӄ(�R��V��Ɉ�
+6"�Tb��!D^n��kKyq"���A������k�@���(O�p�>��+�Y��0��ko�W^��>�'x���6�ֽr�X�h�F��]��XT���qJ��k_�[N�y��;6q睷3�7�đ[�5�3 ��ze+[g�&gtYi�0�m�Dn���}m��"m�ƶϠT��T2TST�#l�0�� ��{��?v��:�5���+��q��H�ͯÍ��,3s��{q?�|������==uT3�>�	�o~rv�E�!r���� #
+�����|����s�غmw�y}�E5y�Kɫ岩��¬�]�~_j]O���R�rr�d^ʛⳁx����
+h���X5X��*-��0���	BJ����v����ZЪ&w"����Ǎ���[�Y,/N�����x��q&'6�������x��-j+$`�&�^�U�t��B�f�8y���x���#�q��LL�A2U���I��JӰ�,WB�$��)��`�(�eҶo��x�R&tj���cc����f)���5d�x^����������+!b�ceJ,l�%�������Z���O��K�۷��n��j5�p�.��bua9�)�Ͳ�S��l߸q=w~�N&֎��:+�(�b��t�V��I�K�L�|���W&`ey_���ϖ�R��%�����(���H����j�^��T&�AyO��Jvy��+�t:+����uq��4M9s�,_9ȋ/�㦛�R�֮�L��K�| �(�@�&����i��kװf��u����3��_�:,Й����^\���	���^�\8�-پ���t��$WPq�k(�w	�� �4Lt��Ɵ&��$�n>�9))Ga�� Y������&���@R
+Ӽ%�7��XccìY3�s�3���?a��ͬ];FG��E]�j��L���<y���yF�G���@��X���� �V��j']��c�uqy�ܿ�p=����׋�ɯ��T3G�j�Ժ0+i�z9-^ޗ����-���:�%Wd�[��}�����5��S���FG�������c�歌��:V2XmDl�0)f�%�<y�ZO���>D�L�D&&�]���e�,qnm� �C��Jj 9��a������W��Ӭ��#��&��8��&��4i�Yq^Q/ ���m�}�P�<+�U |������M�9�(�C���5�x�#G����G�@t�Qt��u�b�+J�&�9{������$4m�8�a3/�l��]���ɦK��wu���{�W�Ω�?	1�m�k�'R-�6��8��C�Q�ܱ�my�q�����Қ���vKXi,rR�N�,�<@c5�:�̺İj-fhx1��N�:E__===-�W��_�,<Ώ���gΞ������^2R�Qm���bb�ML���-�3�HJ��_�� �4i��9�v��έBy\�ג�dr}[]�}0vS�j�U%g��-o�NL)M�R��2O��q�_c�l�a�kj�_Q��MQi"�+����x�u�n����@����	�E]��j���$I����z�z��DQL���S��l�"�/�,��rL�.�F�(R����l)yyY�+[����6�u]�c��*�>��:*�O����*�M!}�@i��5��X�F�y��O]�(%ED����)�ϟ�̙3lڴ�����L����	���9�!%#��/^�l܄Tk�c(K*�O�u�0m���c��ʯ���iec~��6��v���$JǛy]����!����j���W>V8O9Ӷ��pM��Sc�{��Xr���rᦢ���g�	333$I�~�.��b�A�~Z���c��SM�4��9^�+S��E�A.�rWFP��3�s(.�HU&@�m�Oy}Ȱ@Uz��aI�g�<�Ѷ�Q�)�[���eY_�l��,��Z����k®���a����f�"�{�e,.-��n[��V)s_~axu�1�&d��82�ƕzP|	�L3��\�ݵ�'Rx��c��N��1E&����V|:3j�H�'N33�H_O��N�yw_�,۶c�r�"B:��,m��N�şK�R	q_��W濈b!IS�zmn���.��+Or�@�|�R��R���+�ʲ�v�ϗF�RA�$��D�p���<E(��l$1�^�O�^c��u��>tC�e�[^���	f��˖T�$��ei]��^~�du�o;I���3��F)2����=�,#˲�J��F���:	���	�9�q�V��I�M�a���wq���.�[�B)h\mA r��+�2E|�R�G�M��ݗJ���LZ0$b*���^{�0�'&ؾu�םl��!b 3w���~���]Dİe�F$��Za%!u��Bn�@��4/?1cc��ĺ��R4r]���.�袌ˈa��p��˓L�Vk�n�����X~���Q��� ��%t�����d|I
+U��+-�aD�"5~�����5�M�>�%�B�j���p��Μ�@c)������1�|�/_�BB�$��k�~��ײ�����������;�8��iA ��X����UH���,y\S�e�ɣ⤂��������P��j?Ӳ�폨�8��Z�tvX""�̑����$S�h$���e���Id�5M}�V1���0�]�S�=~cW߈��s��h�(��}	��Fc����9���ǩ������O�����x�W6V��Z�.��)Tg��4�<��Z_$�*��E]��2S;�py��IG²���*÷�f:���
+F.7�?�B�,��nA���[���DX��i� AW�$#g��QC�j��C��b��0�d��ܚ�[�_��:����%�z�	���p���l߹����Or�G>B�����k3�(.�F��~i�j]��>�a.�ڿ#s~%֌�Ĩd�A�kli�n.4��)�W!�MG-o��KOH[��/'-}�%���N��m���1��;�P�
+Dq��e����G� �D�f������#���Jo�ZA�I��DIDDD�M͕8���|��3W�8�C�!��@ӌz��1^|i/��2�붑�Uc���w�6&�+7P*���%��E����HT|w-�,�v�E�l.R2RT��ꡥ���*m��o��/h�_񊾋mʨ��̇oD��N#m:�Q��-H�&"1�ԈL�X�$�`5A%uDHS*��,d��kB�R!����hfֹ�������d4?y��^��{D�Ɓ�x���f|�;���[G4"Ռ�6@�[�Z�E[�<��qcRJ�*�����j�ה�eBV#�
+X���~�l�4�Vp�͛M;4[f٢X�WҤ��Pn� D�L���#�"�,��\ MSj����*��)6����(K���.�$�Մ���j1�Xj�K�����*���\���)�(�$a~~���D���Fo���}��,e~q�G}�陋|�7s���\4Œ\����J�*-����\֠G	�댑��E�d�I�袋�-B&X|���%Aiz�;�d�����//�����#�?�Ʌm��p�z�F��0?���ap���z1�$��D�,�L�L�0!����_�Ru�I�b*KI���"��M"�Y?b�H�(6N�ť&�s�4	�Z���*�SdMl[;ȃ�����c�����}�soO�y�z���@�%��B%.�j�$�G��PiԚ=K���:���f]q�Ԓ	�׾j��6�/{�h��R���	"�b��>Mb���ss3LO-P�M�瞏�}�vz{j@�hıcG9p�u�:|�F#����7�{������#8t�0���3hRc��9z���VR�6IҌW^}�W�ΩSg�m;ƹ��[X;��4�M�x�I.L]`Ӧ�D�˙��ę�]ƍ�x���rc�����_"`nO�k9m����]t�E;\���{K���+�EOCZ�T�}'��.�(�r�������E���~�;'i6�}�4i��ڽ��n���5D���42^9�&�̙�DQ��`�[o����7�����.N���Wx���8��,�J�[?po_8��ں�_�07�ľ}x�cL_��w��=���[&���Xz�߽���R����ɬe�1��R�&$v�9ADs���c̈��O[X�4�u5���FYR�h�*&`~�x��܉��Dm�I���ϖ���I��N֞�g��Pu�M�駞���ӌ������%N�{#1=�:�n�FJ���gy��g8��k��,P���8{�(�Z������)�y�9^}� �ń!��=�ұ�&2�p��I��y�>��bB���}�=��j���!��8Ï�n����ؾ��G�8mқ�-	yF�
+�pٱ�(0[�1MI�*�;�7Uw���E]�*\6�@	�$B�TA�,Eoł&�d+�n�++|%B���V���,�?��]w�b���LO-2ua���R�W�齅���I��≟?�����V�Hġ�o�f�ı�놝X�~�O���:y��ԩ�}�f�9{�-��QR�^y�5^���NΓ6���v�ߎ?��-�Tk�Y�����͝�6 ��(�����V�-}���U9���%���<G-Ǆ�`KF���A����	�ޱmR�m'`~��SW��0�W�Y��t�ܠdֻҌ��~����0�����}��TL����G^��l���v�М��?ó�|�]�v���l����7����`�����Nr��w��K/����ڽ����l�����g������E"#�F�O<���'���w�[���s�/����̯�c��������Yn�i/�:t��9W��8\�X�J�z�cs��v<���r�u4S���F�9�By-�@�R�hUvA�L�V:S�\O�L�$�H7�&�@2~���C�~��G��������ؼq���~�g������Y���{y��0���O��g�������5D���'������w�G����A��c?�g��[æ���ȣ�g�����ϲe�v^~�E��?���2>1@�^��MD�T���C�?�2���LLaj)Ԥqu3�Q��'�:V��A�ش��0~�a�f����}`0r�(�FRhH)h�L���%Hi�)�b���N�U-2.x=UHI���>��&��zh�%���]��\��I�����d�m�q�m����$����]{x�C���-n��a}�	n�q#��^��k�1�����s�]|��,���ď~��:3S���/`ӌ/�`d��ӻߦ�X◿����ٳmʹI�V�DBL�ڔ�&֤��WF���FBa	%(�[�J�f��A�H�/�2G�袋��g����3�fd�8��bi7��oO�G�yk����Q��ޏ�n�	��~�:��nfi	�U��y�g/�o���r�{������x��8yz�S������'_�s��|�=4u	�X���|o�S���i4Y\X���_f�΄3��Ol*4����˷��w�YJ��CP�R��ٓ��g9t�M��66LN`��
+���  vIDAT�F�o#�MgŒ�l.���U��	�ɰ��p�K(��-��4��V/k��C+��]�&��g�"~��A�q�K����=�%�Mb�����S%�Gf��x�25S����E�l����22mP�"z�ج��|�f)�OL���[��D)�M��U���(%%�	SY71��P?��
+65����ܵ�F��菞��gޠ��8�z� ��ɡCoq��c|�'?��{�0��BJ�p߾��	G�)�����-3���H�3�}~������]tq}�eM��ݷ���Ļ���BxO/F����C.~�%6EUC�ld�"��%�	)MRk��h�����.!C�=��H��4U���9��`�0��4u�H��� �jFImB3M������24�K�e�{{��߿���6Q�;�3=7�cO�������u|莽Hݺr��H��3N�c�.�e����U4�/l	5������K� /��L��cQi������=*��r1I��j��㠾뻈��O�`�	�H��ݵI#[BE�bIIȤI\�,%s,5�I��MUi5�Z�L�(��,�H�h����cn�"�d�ݧ$Tz-�s�m�X�v��&Db���Ӝ|{��>z3�ci<�bc�F6O&	�#�&�&�������U��0�i�����R!�7<�qeF���^�-袋.�"�����vŘS�%,�X��땒�KAù�s�����WTH Ż@�d��s���'+��J��ؘ�ќ�V���,�L'`�.hF��%� qD�)sK3,5�ȬAe	���v�^�-�������M�T�J�Y�畟=��_=�����f&&Ie�]w��]/�uY]!i{����,����;1�\�����W5�@�����e���V��r��D�r�zӴUg�A2�$d,�:/�$]"��W匲M4N�~�.Μ���7Y��NoO���YN�;Aܳ��ɘ,�eö>�^8��������s��ۼq�M.\��]��8e�jM�"n�3��
+�S�I�Y�n�s������n$U�A8w~��A���,�����	K�d��e��Rp�C(��x�G8R�j�eX2]rTLc�G�=6��.�X-h�=��C�a�B��.��'`�E�ߍ|(�u�2�8��_�I�Z%S'׭�r�40Dy�S\�ر{��'�����؊�~��18�O�7!���5�:�&���1�aY�p��79u�4��됨I�7aˮ>z֮��a����<y�9�ff���x��O�a�����ع+.9-�I��Ҽ0�*�aL��'|wn\��}�����<>�+}э[]p�����s�e[4�4݂�z�/d�>T)O�wUC�,R�D���"Ν(2H�#���	b2DR2��z����o�ã<��/��`������+�y�5�l�`�-��j���[���#����"q���u����?z}=��B������~��,=9Mj����&��ܲ�&n��&2RRRbbν���8x����D��?�N-`!k&4��U�Q u�X*�!E�|&i�+;ǨF��S7��.V3
+{��l)��1���HWr'2O��i0o�R���������V�`�Y�e�0��T�� V�)��������l��*�ju���Q�U��cx,&M3>�m���R�r��&M��}��^}���1U��R��[w���h�Y���t��>�]��6n�s3'����׾˛������br��O�#Մ��>굘��fy��ZO��=��<���!(���bz-H�)��8	n(�;��,W?V%S�}]�<Z_
+N}�dM��X|p�x�W��Z���.*�
+BE��4Hu�T�Dj����	�<0��b��:�H�Kz�&�Ln�O��c?~�����Nc.b����y�V>t�.�TY�>r�m,.5��^�?���F=�p�ضc=�h�@�K�~獜>w���z���?�4�r�m}|���X39��N�f.��UIX�Tj�B�"��6��y�1`��i`�N�h�ܵ��XQ��B��A ���.V/��W��*�5�V�D�w��=I�T`��\I��*�{�6u���U�zB*3�Bj2Wꡚ!�E0���-w|���/��O�O����Q��1��~�Nnؽ��֠RW��C,%s���_��x������l�i3�k�,�����>��?��G�_��S����7�nr=Q\���s<�ī$I���gߠZ���2�������+���@o_�7�Έc��t�)�D��"���^������#_�<E(���^: ���X��(�z#�*�E1X�lFf���Xor��� @o����Go�����w�R�#��p�տ��z�0<Ra��`�X���/�ۻ�%a%���7��op����!҆R�Lnbt����UH�޾�u60{���W��*&���!���y�^��da�	��w�2�a�j/�, F��ڤ6`���شuzh�%o�>���8\�X�{��L�]$��/�s�X��7Q��U�%]]tq}�-�(X��@ M-Y�,0�f�B�_��;���x�׮�IX7�'"D2z�#���[�� Q�L,�-�xh/b��Y�ӀR�r��{ټm33SMD���&&��*�,�(#k��ă�p��,�	�������V�=CBfY�n�O~�^����,--Q�*���#�Zn�u��?�;@�����u�Q�U�Ǹ�Yi\�ϐ�Y�	�[�l���BL/��-F�{��7#�#};I��H�`��0�\��},Y�V��`��h����}��q2B���
+p`�|�@E�v�(��a�T�Xj}uv�CUIu	|����*�Fرs�B�M��Q#a���x���1Dp(��|fS� ��x���I�'2VSPg�w��L2��*���0�n��Yhi/��|ia��X�(��	�D��w��g8�^�y��.	뢋ՌBv���ʰ8����|M��u���eB./��e]��
+\\��T����&�A��Ĩf$�d�i26Qa��x��n���X�D���GX�i4B����^T(K$,��ظ���[{��,K��T��r��ۜ�7M� V&<MWuQ\V��u�
+E��2�q�F�k�������2E�7es��]��̭AיL_�̱�<lP\�_f�c�����'�&܂jL>������,��Ay�����(�!�%���(b����B�d�@�G7�m!\�C*�`F��B�juڄ�4�43792���.33S7"��N�E�J��QQ2�X5�,͜�.�֯dD�]��	��u�0Y�i�ֺ4i�Mm���.V?
+�W΂J~
+u���,e�E�����V�V{V��j�[�	@AV[��B���ڪ��N}x���kh`}�<��l��.��~�:|#��Aν�
+�%r�'X\����$���wmֻ���_�� D��T�����IQn"w'z�*�56����}'�,��	������`j��ZAm�joE�bD�bR\�?���E�����ǈbD\�	�qj6#�R��q��ڔH��@���j>q�xF�U� �l4�L�����O~�`0�׬!�V� ~RW�_B�	����x�����߀J꿅-��ńYMќ���D��l�袋���?T����%�ݮ,�,�Lmq����Buz�|�.�?ȝ��'%&��X\�%�9�&Ʃ�⒱T���2DQ�D"2�E1i� ���`�����م�.�*��k4%6�TS��&1�ĆD3O��?�z8/���̂t��#���c�����G����>C�U��u%���ՊUJ�\]�2ck��8|�������A�!�X���@*�H˴%`Ň�]>�"&�0W�JI�!��-u4@,�x߸Qĺ/�:�/�&`�5�$�'�(yd��`}cU�N0��d�i�>�S��Jd�8��Y�y<y �����X�l+Ml�O�*r���gMU|b�#���Z~���n]t�ŵ�K�w8�@	��5��=���,� 4<��#B6^'���m�!��Ŗ򞾘�f��A-���L3D����ֺp�	�b���x���"g8P�XW�����a4"��S޵��+�#".D��^�����z�����!(K�Ϻ����ۉ��-�+���Ӭ�68��g<慴�?j���,M�zcpa��S� ���J	��3|iq�e�^9�3f�g}?g����4=s�#h���r����a�r쀈��t�.�>ex�U�4��<�mdD��������Y�D,H�bn2˼���`�&V�~_'��A����.��ڢ�1����X�w��q��Z�A���l�ٙEz{���ܚ��E]\?p2�Z��fl��-s3���[W%�����"x�@��*�n��4�����	`�����;ЇNv+o=R����\�"��
+FD���`,&���2]�/�!��x!�ٛ�Җ��@h��R��ܷ������B�,��{���pL���u.�,���E��և��s�ۿ^m�V1? 
+��ص�F�y?��q����X2Ld|`a� D�w��zK{i����8&X�C�v�^�v<	guT�����T��h����^w-%���b��r�Ac,�ݽٟ������Q~����A�1�"�c��"gN\dq�296A��q��*�t��u�P�B�H%��a��{G��nr��CkHS��?S�ї4���_I֕)�J]��ʦ �7�VA4F�e.�^Å�8�Y���庺 *�/���C9B��`a���<g��3�"���*����Q�N���]��R"8W����uf�Os��,�3)�֬%��2k�j$_��	X��M������9t�9^��!n�e}�Uj���[K��#?&��٢*��Nډ�1EA�rܒ��RN�.�R��b� R�ť�kȋ?~��a�X))���W���ߥyXX�� �`�Ri�++iy }� �{hD�D4�^|�G]�^f��z�z���� ��s~v��u/'�If�_s[OTeӺm�ޱ��^�_��[�P��u}p}����&�/'ǵ|�N(z��$"r�U(��Q�;�B�ep8aL�I�86w}⎧�<�b%�WW��[����S√K�
+䬽��{�Re��q#�M>�~�1��}���3�=YA���S����q��9CEX�f�Z�F�X�v�6Kت%`���M��"�r�o���_䙧�ܹv��EOO�A��6�J\A|J�2�O�N��N�#�D�L�M��Z[ˎ�mzZ�Vyr�OH��n���������S�_���m�q����}�;o	�ק���j-�sK���[<��>�9��73ؿ�u��Wz
+m��.�XE2'�����R�Čo����{�|��{��gٳw�}50`մ��J�XY����sW��R�xcw�@�JJ���ɠ �ݷ�<y�i�(tv��m�c9�H��2�K�5�n�mlVBy��V�|��D�XO��f�.S4K2���*O=��h���f����A*�J땄��UD� $˲���9:1ѫ���J5�:+�K��>�s/��o�ӷy�W��Y ���{��+��N>�Vzx��K���e�m�����N��i}oƤdd.	2o�����p��[v1>����lX��O��C��S�D��颋.V�,(|ey��R0.Y���ۇy�����������p�wwI-
+�K�,9�dp�{	�E��:�wm�ؾo8�����"%�^�Z�1�$���Q^��U�|�0�0:�P�1����[od��$�C�l�r�~�^��'�T*y���A�}�zV�J�_���z_����ӳSz��^>���G���"�`c���O�w�¢��0	&���w���$��ܔ���}�d�	^:��J����"�W2)�5�Kb��������i����E��a���㛸�ƽ�ܹ�ޞ����%`]t��P&`�bMj�&V���$�S�g9r�~���8q���yW��]^��� !�C�u"�`uV'���!%� �Ǉ��g@�̧4�Jv����+��EB��",�\`�	�e"�;�N��ө�ա�^q�h�q�Z��G^���{Ӎlٲ�Z�v�ƀu	�e���Z#��Bp�Y�J�4���yN�<�ŋ�i4�A3\�����K�����Q�8��<���/P<a�d8R�]��\��a_o�ֈ�.��]����^�\��s�&��z�8����;t�Bl���3�v������ı/q��]t��*A�3��u)FU����Z�Zu�>v*�	�Ξ�̙3LO_��l�LU��u9���D�@�x=9�br��j�00M����+���kwSh�}��2�v�\��P�
+�����ǡd0X��-]Cn��y�8���-ꋍcB�H�2>�����R��KD|G���o�{w��(`��=S���oWy^��5����ǘO���>U֌4���	�2��\.b���E�~�k2�٩������,??D̏�����}b/�KZ����x/}b�u�~.��j\ ���|��]��o/:ce�Б�>׭Щ�Ӊ�e'�����p��^M�'"���Z�Q )�F�]�t��0���
+��;g�����N�r�>˟�Y��XL�uL��u���޶t����b�A���$�w-R�����_��t˙�v���f�z����!3���3{\v]'n�����M~����A>�r8��no��z��(v��+pX7����/��5^ĝh�� �E�G����e����
+��Wkr=�݃b����t ������)t�*t�Fۥh�m!7��-,��4��]R�S=H�#����ti��5]�Oȩ �G{��w?��l� �-���d�L׽s3�ꖯ���fcv^o���<4�2Kύ3����[�]��Aj�"tǤ�"�XW[�,��"��h��"�-~k�� ���Uu��zs<,�۟鱗7���r��Kdg����`�K��3�?#j�����QI��q�~�V��q�n3���t��,w�����C�%ݵ��/�����%���C��y���-q��-[��y���n����ǯ�:��	5
+-/m�Vi��r�w�x��+{ouPu�]`�&Ůŋ`Â�y(���7�=��Y]�   �-�Y  4F   �  @c`   ��  4F   �  @cE3�/9�  ���  �  @c`   ��  4F   �  @c`   ��  4F   �  @c`   ��  4F   �  @c`   �}<;@K��j����������=��uJ�eSʇ��� �SZ�V2x��q�B�_�=-)�P:��8��y��i�޺�W�.YNK���,�f.�G������A���4��8��z`�<�=T����P鸊y�i�  �e;ƥ���o�~��2))c W`جP�Rӝ��
+�,u �j!K� ����.�E��[ۺW{���I��H��h�
+�]*�W�*���ږ-��k=�S��3�Af(����<pE �M�[=����
+�tps��fpt����'�Ni�%/�[�>�:�� "���Ƿ��k��Cbh�\��
+��G���}ox������������4j����J3�����4k��+�\����-�G./�m�y�����o��sە|_��G�xm�E6ǿS��%�V�XkI����_���Z��(���N�0u���e^��J�y��h� ��D]哪@9����� ��gU����b�4Se�/���\ X�N��6���� 6̿cv�#��b`���/f��VsԎŚ�ǚ`iJ�%��<^���rw���q�w�5y
+�����}�����W����ZS禹t�35H[�y�-`ؼG?>�
+�BO����>�Fj^,WY�l�2�e�����a��~Ce��1�-���M�W+I�F�8��}����<;@+�w�T$�+���L_���Ĕ�d���� ��Z�x&0  ��  �  @c`   ��  4F   �  @c`   ��  4F   �  @c`   ��a�_�%�    IEND�B`�
